@@ -1,0 +1,13 @@
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\obj\Debug\netstandard2.0\EnhancedStreamChat.csproj.AssemblyReference.cache
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\obj\Debug\netstandard2.0\EnhancedStreamChat.GeneratedMSBuildEditorConfig.editorconfig
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\obj\Debug\netstandard2.0\EnhancedStreamChat.AssemblyInfoInputs.cache
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\obj\Debug\netstandard2.0\EnhancedStreamChat.AssemblyInfo.cs
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\obj\Debug\netstandard2.0\EnhancedStreamChat.csproj.CoreCompileInputs.cache
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\bin\Debug\EnhancedStreamChat.xml
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\bin\Debug\EnhancedStreamChat.deps.json
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\bin\Debug\EnhancedStreamChat.dll
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\bin\Debug\EnhancedStreamChat.pdb
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\bin\Debug\0Harmony.dll
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\obj\Debug\netstandard2.0\Enhanced.F2985584.Up2Date
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\obj\Debug\netstandard2.0\EnhancedStreamChat.dll
+F:\Unity\Project\BSAIReader\EnhancedStreamChat-v3_AIReader-master\obj\Debug\netstandard2.0\EnhancedStreamChat.pdb

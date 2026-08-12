@@ -7,7 +7,8 @@
           <text text='Enhanced Stream Chat v3' align='Center' font-size='8'/>
         </horizontal>-->
         <tab-selector tab-tag='settings-tab'></tab-selector>
-        <vertical pad-top='77'>
+        <vertical pad-top='77' spacing='4'>
+          <button text='测试朗读' click-event='test-speech'></button>
           <button text='关闭' click-event='hide-settings'></button>
         </vertical>
         <tab tags ='settings-tab' tab-name='布局'>
@@ -38,6 +39,17 @@
               <clickable-text text='点这里' default-color='#00bcff' on-click='launch-web-app' highlight-color='cyan' font-size='5'></clickable-text>
               <text text='.'  font-size='5'></text>
             </horizontal>
+          </vertical>
+        </tab>
+        <tab tags ='settings-tab' tab-name='语音'>
+          <vertical pad='10' pad-top='5' child-control-height='false' child-expand-height='false' child-align='UpperCenter' pref-width='~settings-width'>
+            <bool-setting text='启用AI弹幕朗读' pref-height='6' value='speech-enabled' apply-on-change='true' bind-value='true'></bool-setting>
+            <dropdown-list-setting text='朗读模式' value='speech-filter-mode' choices='speechFilterModes' bind-value='true' apply-on-change='true'/>
+            <dropdown-list-setting text='朗读声音' value='speech-voice' choices='speechVoices' bind-value='true' apply-on-change='true'/>
+            <slider-setting text='朗读音量' min='0' max='1' increment='0.05' pref-height='6' value='speech-volume' apply-on-change='true'></slider-setting>
+            <slider-setting text='朗读语速' min='0.5' max='2.0' increment='0.1' pref-height='6' value='speech-speed' apply-on-change='true'></slider-setting>
+            <slider-setting text='最大队列数' min='1' max='50' increment='1' pref-height='6' value='speech-max-queue-size' apply-on-change='true' integer-only='true'></slider-setting>
+            <dropdown-list-setting text='TTS服务器' value='speech-server-url' choices='speechServerUrls' bind-value='true' apply-on-change='true'/>
           </vertical>
         </tab>
         <tab tags ='settings-tab' tab-name='关于'>

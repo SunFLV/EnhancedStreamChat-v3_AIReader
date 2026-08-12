@@ -17,8 +17,8 @@ namespace EnhancedStreamChat.Graphics
 
         public event Action OnLatePreRenderRebuildComplete;
 
-        private ImageView _highlight;
-        private ImageView _accent;
+        private Image _highlight;
+        private Image _accent;
         private VerticalLayoutGroup _verticalLayoutGroup;
         private bool _rebuiled = false;
 
@@ -82,7 +82,7 @@ namespace EnhancedStreamChat.Graphics
 
         private void Awake()
         {
-            this._highlight = this.gameObject.AddComponent<ImageView>();
+            this._highlight = this.gameObject.AddComponent<Image>();
             this._highlight.raycastTarget = false;
             this._highlight.material = BeatSaberUtils.UINoGlowMaterial;
             this.Text = new GameObject().AddComponent<EnhancedTextMeshProUGUI>();
@@ -93,7 +93,7 @@ namespace EnhancedStreamChat.Graphics
             DontDestroyOnLoad(this.SubText.gameObject);
             this.SubText.OnLatePreRenderRebuildComplete += this.Text_OnLatePreRenderRebuildComplete;
 
-            this._accent = new GameObject().AddComponent<ImageView>();
+            this._accent = new GameObject().AddComponent<Image>();
             this._accent.raycastTarget = false;
             DontDestroyOnLoad(this._accent.gameObject);
             this._accent.material = BeatSaberUtils.UINoGlowMaterial;

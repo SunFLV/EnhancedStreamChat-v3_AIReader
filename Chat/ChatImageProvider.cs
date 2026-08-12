@@ -5,7 +5,6 @@ using EnhancedStreamChat.Utilities;
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
-using BeatSaberMarkupLanguage.Util;
 using UnityEngine;
 using UnityEngine.Networking;
 
@@ -71,7 +70,7 @@ namespace EnhancedStreamChat.Chat
                         Logger.Error($"A network error occurred during request to {uri}. Retrying in 3 seconds... {wr.error}");
                         yield return new WaitForSeconds(3);
                         // this.StartCoroutine(this.DownloadContent(uri, Finally, true));
-                        _ = SharedCoroutineStarter.Instance.StartCoroutine(this.DownloadContent(uri, Finally, true));
+                        _ = CoroutineRunner.Instance.StartCoroutine(this.DownloadContent(uri, Finally, true));
                         yield break;
                     }
                     activeDownload.Finally?.Invoke(new byte[0]);
@@ -126,14 +125,11 @@ namespace EnhancedStreamChat.Chat
             int spriteWidth = 0, spriteHeight = 0;
             AnimationControllerData animControllerData = null;
             if (isAnimated) {
-                AnimationLoader.Process(AnimationType.GIF, bytes, (tex, atlas, delays, width, height) =>
-                {
-                    animControllerData = AnimationController.instance.Register(id, tex, atlas, delays);
-                    sprite = animControllerData.sprite;
-                    spriteWidth = width;
-                    spriteHeight = height;
-                });
-                yield return new WaitUntil(() => animControllerData != null);
+                // BSML 1.40.x: AnimationLoader.Process/AnimationType API removed
+                // Animated emote support disabled until API migration
+                Logger.Warn("Animated emotes not yet supported on BS 1.40.x");
+                animControllerData = null;
+                sprite = null;
             }
             else {
                 try {

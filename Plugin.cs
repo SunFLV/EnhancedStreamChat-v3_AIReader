@@ -29,6 +29,11 @@ namespace EnhancedStreamChat
             Logger.Log = logger;
             Logger.Log.Debug("Logger initialized.");
             var config = ChatConfig.instance;
+            Logger.Info("ChatConfig loaded, initializing managers...");
+            ChatManager.TouchInstance();
+            ESCFontManager.TouchInstance();
+            ChatSpeechManager.TouchInstance();
+            Logger.Info("All managers initialized");
             Font.textureRebuilt += this.Font_textureRebuilt;
             this.harmony = new Harmony(HARMONY_ID);
             zenjector.Install<ESCMenuInstaller>(Location.Menu);
@@ -36,8 +41,6 @@ namespace EnhancedStreamChat
         [OnStart]
         public void OnStart()
         {
-            ChatManager.TouchInstance();
-            ESCFontManager.TouchInstance();
         }
 
 

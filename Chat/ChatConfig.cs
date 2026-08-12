@@ -81,7 +81,6 @@ namespace EnhancedStreamChat.Chat
         [ConfigMeta(Comment = "游戏中聊天框所在层级 The layer of the chat while while in-song")]
         public int Song_ChatLayer = 5;
 
-
         private ChatConfig(string configDirectory, string configName) : base(configDirectory, configName, Path.Combine(Environment.CurrentDirectory, "UserData", "StreamCore", "TwitchLoginInfo.ini"))
         {
             Logger.Info("Config initialized.");

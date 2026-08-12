@@ -32,6 +32,7 @@ namespace EnhancedStreamChat.Chat
     [HotReload]
     public partial class ChatDisplay : BSMLAutomaticViewController
     {
+        internal static ChatDisplay Instance { get; private set; }
         public ObjectMemoryComponentPool<EnhancedTextMeshProUGUIWithBackground> TextPool { get; internal set; }
 
         private readonly ConcurrentQueue<EnhancedTextMeshProUGUIWithBackground> _messages =
@@ -43,6 +44,7 @@ namespace EnhancedStreamChat.Chat
 
         private void Awake()
         {
+            Instance = this;
             this._waitForEndOfFrame = new WaitForEndOfFrame();
             DontDestroyOnLoad(this.gameObject);
             // Logger.Debug("ChatDisplay Awake");
@@ -196,6 +198,8 @@ namespace EnhancedStreamChat.Chat
                 }
             );
             ChatConfig.instance.OnConfigChanged += this.Instance_OnConfigChanged;
+            // Initialize TTS speech manager
+            ChatSpeechManager.TouchInstance();
             // BSEvents.menuSceneActive += this.BSEvents_menuSceneActive;
             // BSEvents.gameSceneActive += this.BSEvents_gameSceneActive;
             SceneManager.activeSceneChanged += this.SceneManager_activeSceneChanged;
@@ -248,7 +252,7 @@ namespace EnhancedStreamChat.Chat
                 this._chatMoverMaterial.color = Color.clear;
                 // Logger.Debug($"chatMoverMaterial created");
 
-                var renderer = this._chatScreen.handle.gameObject.GetComponent<Renderer>();
+                var renderer = this._chatScreen.Handle.gameObject.GetComponent<Renderer>();
                 renderer.material = this._chatMoverMaterial;
                 renderer.material.mainTexture = this._chatMoverMaterial.mainTexture;
                 // Logger.Debug($"Setting up chatScreen handle");
@@ -441,11 +445,11 @@ namespace EnhancedStreamChat.Chat
             chatContainerTransform.sizeDelta = new Vector2(this.ChatWidth, this.ChatHeight);
             Logger.Debug($"chatContainerTransform.sizeDelta: {chatContainerTransform.sizeDelta}");
 
-            this._chatScreen.handle.transform.localScale = new Vector3(this.ChatWidth, this.ChatHeight * 0.9f, 0.01f);
-            this._chatScreen.handle.transform.localPosition = Vector3.zero;
-            this._chatScreen.handle.transform.localRotation = Quaternion.identity;
+            this._chatScreen.Handle.transform.localScale = new Vector3(this.ChatWidth, this.ChatHeight * 0.9f, 0.01f);
+            this._chatScreen.Handle.transform.localPosition = Vector3.zero;
+            this._chatScreen.Handle.transform.localRotation = Quaternion.identity;
             Logger.Debug(
-                $"_chatScreen.handle.transform.localScale: {this._chatScreen.handle.transform.localScale}, _chatScreen.handle.transform.localPosition: {this._chatScreen.handle.transform.localPosition}");
+                $"_chatScreen.handle.transform.localScale: {this._chatScreen.Handle.transform.localScale}, _chatScreen.handle.transform.localPosition: {this._chatScreen.Handle.transform.localPosition}");
 
             this.AllowMovement = this._chatConfig.AllowMovement;
             Logger.Debug($"AllowMovement: {this.AllowMovement}");
@@ -704,6 +708,13 @@ namespace EnhancedStreamChat.Chat
         public void OnTextMessageReceived(IChatMessage msg)
         {
             Logger.Info($"Received message: {msg.Message}");
+
+            // Feed message to AI TTS speech manager
+            if (ChatSpeechConfig.instance.SpeechEnabled && ChatSpeechManager.instance != null)
+            {
+                ChatSpeechManager.instance.EnqueueMessage(msg);
+            }
+
             _ = this.OnTextMessageReceived(msg, DateTime.Now);
             // Logger.Debug($"OnTextMessageReceived: {msg.Message}");
         }
