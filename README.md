@@ -51,6 +51,28 @@ SpeechMaxQueueSize=10
 
 `SpeechServerUrls` 中逗号分隔多个地址，游戏中下拉框可选择。`SpeechVoices` 同样逗号分隔，服务器会在启动后自动写入该字段。
 
+### TTS 请求接口
+
+客户端通过 HTTPS POST 向服务器发送合成请求：
+
+```json
+{
+  "speaker": "用户名",
+  "text": "弹幕内容",
+  "voice": "default",
+  "speed": 1.0
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `speaker` | string | 发送者名字（测试/系统消息为空字符串），后端可按此缓存复用 |
+| `text` | string | 弹幕正文 |
+| `voice` | string | 声音预设名 |
+| `speed` | float | 语速 0.5~2.0 |
+
+`speaker` 与 `text` 分离设计，便于后端缓存同一说话人的"名字说"音频，减少重复推理。
+
 ### 编译
 
 ```bash

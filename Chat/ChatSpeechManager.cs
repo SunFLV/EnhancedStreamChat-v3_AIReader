@@ -47,7 +47,8 @@ namespace EnhancedStreamChat.Chat
         [Serializable]
         private class TTSRequestBody
         {
-            public string text;
+            public string speaker;  // sender name (empty for system/test)
+            public string text;     // message content
             public string voice;
             public float speed;
         }
@@ -280,9 +281,9 @@ namespace EnhancedStreamChat.Chat
                     break;
                 }
 
-                // Extract clean text — include sender name
-                var rawText = $"{msg.Sender.DisplayName}说{msg.Message}";
-                var cleanText = StripRichText(rawText);
+                // Extract speaker name and message text separately
+                var speaker = StripRichText(msg.Sender.DisplayName);
+                var cleanText = StripRichText(msg.Message);
 
                 // Skip empty or whitespace-only messages
                 if (string.IsNullOrWhiteSpace(cleanText))
@@ -300,10 +301,10 @@ namespace EnhancedStreamChat.Chat
                     Logger.Debug($"TTS: Truncated message from {originalLength} to {maxLength} chars");
                 }
 
-                Logger.Debug($"TTS: Processing: \"{cleanText}\"");
+                Logger.Debug($"TTS: Processing: \"{speaker}说{cleanText}\"");
 
                 // Request TTS from server and play audio
-                yield return StartCoroutine(RequestAndPlayTTS(cleanText));
+                yield return StartCoroutine(RequestAndPlayTTS(speaker, cleanText));
 
                 // Small gap between consecutive speeches
                 yield return new WaitForSeconds(0.3f);
@@ -323,7 +324,7 @@ namespace EnhancedStreamChat.Chat
             {
                 cleanText = cleanText.Substring(0, 200);
             }
-            yield return StartCoroutine(RequestAndPlayTTS(cleanText));
+            yield return StartCoroutine(RequestAndPlayTTS(null, cleanText));
             _testSpeechActive = false;
             Logger.Debug("TTS: Test speech finished");
         }
@@ -410,15 +411,16 @@ namespace EnhancedStreamChat.Chat
 
         // ── HTTP Communication ────────────────────────────────────
 
-        private IEnumerator RequestAndPlayTTS(string text)
+        private IEnumerator RequestAndPlayTTS(string speaker, string text)
         {
             var serverUrl = NormalizeServerUrl(ChatSpeechConfig.instance.SpeechServerUrl);
             var voice = ChatSpeechConfig.instance.SpeechVoice;
             var speed = ChatSpeechConfig.instance.SpeechSpeed;
 
-            // Build JSON payload — use JsonUtility for reliability
+            // Build JSON payload — separate speaker from text for backend caching
             var ttsRequest = new TTSRequestBody
             {
+                speaker = speaker ?? "",
                 text = text,
                 voice = voice,
                 speed = speed
