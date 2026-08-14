@@ -25,6 +25,7 @@ using UnityEngine;
 using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 using VRUIControls;
+using Zenject;
 using Color = UnityEngine.Color;
 
 namespace EnhancedStreamChat.Chat
@@ -131,6 +132,34 @@ namespace EnhancedStreamChat.Chat
             // this.StartCoroutine(this.UpdateMessagePositions());
             UpdateMessagePositions();
             this._updateMessagePositions = false;
+        }
+
+        [Inject] private readonly IPlayerDataModel _playerDataModel;
+
+        private bool _hiddenByNoTextsAndHuds;
+
+        /// <summary>
+        /// Hide the chat when the game's "No Texts and Huds" setting is active.
+        /// </summary>
+        private void UpdateNoTextsAndHudsVisibility()
+        {
+            if (this._rootGameObject == null || this._chatScreen == null)
+            {
+                return;
+            }
+
+            var noTextsAndHuds = false;
+            if (this._isInGame && this._playerDataModel?.playerData?.playerSpecificSettings != null)
+            {
+                noTextsAndHuds = this._playerDataModel.playerData.playerSpecificSettings.noTextsAndHuds;
+            }
+
+            if (noTextsAndHuds != this._hiddenByNoTextsAndHuds)
+            {
+                this._hiddenByNoTextsAndHuds = noTextsAndHuds;
+                this._rootGameObject.SetActive(!noTextsAndHuds);
+                Logger.Info($"Chat visibility changed by NoTextsAndHuds: hidden={noTextsAndHuds}");
+            }
         }
 
         private FloatingScreen _chatScreen;
@@ -349,6 +378,7 @@ namespace EnhancedStreamChat.Chat
             }
 
             this.UpdateChatUI();
+            this.UpdateNoTextsAndHudsVisibility();
         }
 
         // private void AddToVRPointer()
