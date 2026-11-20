@@ -3,6 +3,13 @@
 基于 [lyyQwQ/EnhancedStreamChat-v3](https://github.com/lyyQwQ/EnhancedStreamChat-v3)（上游 `dev/catcore` / `main`）
 二次开发，在 **CatCore 架构** 的弹幕板上接入了 GPT-SoVITS TTS 后端。
 
+## 10.2.1 更新
+
+- 队列上限默认 30（原 10），队列满丢弃时打印 speaker/text 日志
+- 返回 WAV 做完整性校验（`data` 块长度与总字节不符视为失败）
+- 后端 502（如 P106 短文本返回静音）记录完整 detail；**不自动切换引擎**
+- 保留服务器地址 IPv4 回退（`6.sunflv.top` → `ai.sunflv.top:39281`）
+
 ## 10.2.0 更新
 
 - 更新 CatCore 到 2026-09 构建（修复 B 站扫码登录 Cookie 提取）

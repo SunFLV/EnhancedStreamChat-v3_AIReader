@@ -70,7 +70,7 @@ namespace EnhancedStreamChat.Chat
         public float SpeechSpeed = 1.0f;
 
         /// <summary>最大队列长度。</summary>
-        public int SpeechMaxQueueSize = 10;
+        public int SpeechMaxQueueSize = 30;
 
         private readonly string _path;
 

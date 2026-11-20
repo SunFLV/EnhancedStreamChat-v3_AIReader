@@ -3,7 +3,7 @@
   "id": "EnhancedStreamChat",
   "name": "Enhanced Stream Chat",
   "author": "denpadokei / AI Reader",
-  "version": "10.2.0",
+  "version": "10.2.1",
   "description": "Enhanced Stream Chat is a rich text chat integration mod, with full unicode, emote, and emoji support. AI danmaku TTS (GPT-SoVITS) integrated.",
   "gameVersion": "1.40.4",
   "dependsOn": {

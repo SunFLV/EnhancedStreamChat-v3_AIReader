@@ -181,9 +181,13 @@ namespace EnhancedStreamChat.Chat
             if (!ChatSpeechConfig.Instance.SpeechEnabled) return;
             if (!ShouldSpeak(msg)) return;
 
-            while (_speechQueue.Count >= Mathf.Max(1, ChatSpeechConfig.Instance.SpeechMaxQueueSize))
+            var maxQueue = Mathf.Max(1, ChatSpeechConfig.Instance.SpeechMaxQueueSize);
+            while (_speechQueue.Count >= maxQueue)
             {
-                _speechQueue.TryDequeue(out _);
+                if (_speechQueue.TryDequeue(out var dropped))
+                {
+                    Logger.Warn($"[TTS] Queue full ({maxQueue}); dropped: speaker=\"{StripRichText(dropped.Sender?.DisplayName)}\" text=\"{StripRichText(dropped.Message)}\"");
+                }
             }
 
             _speechQueue.Enqueue(msg);
@@ -542,100 +546,122 @@ namespace EnhancedStreamChat.Chat
                 if (!bases.Contains(b)) bases.Add(b);
             }
 
+            // 只使用用户选择的后端；不自动切换到其他引擎
+            var indices = new List<int> { _serverCount > 0 ? cfg.SpeechServerIndex : -1 };
+
             const int maxAttempts = 2;
             foreach (var baseUrl in bases)
             {
-                var url = BuildUrl(baseUrl, "/api/tts", true, cfg.SpeechServerIndex, _serverCount);
-                Logger.Info($"[TTS] Requesting: POST {url}");
-                Logger.Info($"[TTS] Payload: {jsonPayload}");
-
-                var tryNextBase = false;
-                for (var attempt = 1; attempt <= maxAttempts; attempt++)
+                foreach (var serverIndex in indices)
                 {
-                    var retry = false;
-                    using (var wr = new UnityWebRequest(url, "POST"))
+                    var useServer = serverIndex >= 0 && _serverCount > 0;
+                    var url = BuildUrl(baseUrl, "/api/tts", useServer, serverIndex, _serverCount);
+                    Logger.Info($"[TTS] Requesting: POST {url}");
+                    Logger.Info($"[TTS] Payload: {jsonPayload}");
+
+                    var nextCandidate = false;
+                    var fatal = false;
+                    var played = false;
+
+                    for (var attempt = 1; attempt <= maxAttempts; attempt++)
                     {
-                        wr.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(jsonPayload));
-                        wr.downloadHandler = new DownloadHandlerBuffer();
-                        wr.SetRequestHeader("Content-Type", "application/json");
-                        wr.SetRequestHeader("Accept", "audio/wav, application/json");
-                        wr.timeout = 300; // 冷启动推理可能需要 100s 以上
-                        wr.certificateHandler = new BypassCertificate();
-
-                        yield return wr.SendWebRequest();
-
-                        Logger.Info($"[TTS] HTTP response: code={wr.responseCode}, result={wr.result}, version={wr.GetResponseHeader("x-tts-version")} (attempt {attempt}/{maxAttempts})");
-
-                        if (wr.result == UnityWebRequest.Result.Success)
+                        var retry = false;
+                        using (var wr = new UnityWebRequest(url, "POST"))
                         {
-                            var audioData = wr.downloadHandler.data;
-                            var contentType = wr.GetResponseHeader("Content-Type") ?? "unknown";
-                            if (audioData != null && audioData.Length > 0)
+                            wr.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(jsonPayload));
+                            wr.downloadHandler = new DownloadHandlerBuffer();
+                            wr.SetRequestHeader("Content-Type", "application/json");
+                            wr.SetRequestHeader("Accept", "audio/wav, application/json");
+                            wr.timeout = 300; // 冷启动推理可能需要 100s 以上
+                            wr.certificateHandler = new BypassCertificate();
+
+                            yield return wr.SendWebRequest();
+
+                            Logger.Info($"[TTS] HTTP response: code={wr.responseCode}, result={wr.result}, version={wr.GetResponseHeader("x-tts-version")} (attempt {attempt}/{maxAttempts})");
+
+                            if (wr.result == UnityWebRequest.Result.Success)
                             {
-                                if (contentType.Contains("json") || (audioData.Length < 256 && audioData[0] == (byte)'{'))
+                                var audioData = wr.downloadHandler.data;
+                                var contentType = wr.GetResponseHeader("Content-Type") ?? "unknown";
+                                if (audioData == null || audioData.Length == 0)
+                                {
+                                    Logger.Warn($"[TTS] Server returned empty audio data via {url}");
+                                    nextCandidate = true;
+                                }
+                                else if (contentType.Contains("json") || (audioData.Length < 256 && audioData[0] == (byte)'{'))
                                 {
                                     Logger.Warn($"[TTS] Server returned JSON instead of audio: {Encoding.UTF8.GetString(audioData)}");
-                                    tryNextBase = true;
+                                    nextCandidate = true;
+                                }
+                                else if (!IsCompleteWav(audioData))
+                                {
+                                    Logger.Warn($"[TTS] Truncated/invalid WAV from {url} ({audioData.Length} bytes)");
+                                    nextCandidate = true;
                                 }
                                 else
                                 {
                                     _activeBaseUrl = baseUrl;
-                                    Logger.Info($"[TTS] Received {audioData.Length} bytes ({contentType}) via {baseUrl}, playing...");
+                                    var duration = GetWavDuration(audioData);
+                                    Logger.Info($"[TTS] Received {audioData.Length} bytes ({contentType}, {duration:F2}s) via {url}, playing...");
                                     yield return StartCoroutine(PlayAudioFromBytes(audioData));
-                                    yield break;
+                                    played = true;
                                 }
+                            }
+                            else if (wr.responseCode == 400)
+                            {
+                                Logger.Warn($"[TTS] Server rejected text (400): {wr.downloadHandler?.text}");
+                                fatal = true;
+                            }
+                            else if (wr.responseCode == 503)
+                            {
+                                // 引擎冷启动/正在换模型时会出现，稍后重试一次
+                                Logger.Warn($"[TTS] Server not ready (503): {wr.downloadHandler?.text}");
+                                retry = true;
+                            }
+                            else if (wr.responseCode == 502)
+                            {
+                                // 引擎合成失败（如 P106 短文本返回静音）；按配置不切换引擎，跳过这条
+                                Logger.Warn($"[TTS] Backend 502 via {url}: {wr.downloadHandler?.text}");
+                                fatal = true;
+                            }
+                            else if (wr.responseCode == 0 || wr.result == UnityWebRequest.Result.ConnectionError)
+                            {
+                                Logger.Warn($"[TTS] Connection failed via {url}: {wr.error}");
+                                retry = true;
                             }
                             else
                             {
-                                Logger.Warn($"[TTS] Server returned empty audio data via {baseUrl}");
-                                tryNextBase = true;
+                                Logger.Warn($"[TTS] HTTP request FAILED via {url} (code={wr.responseCode}): {wr.error}");
+                                nextCandidate = true;
                             }
                         }
-                        else if (wr.responseCode == 400)
+
+                        if (played || fatal || nextCandidate)
                         {
-                            Logger.Warn($"[TTS] Server rejected text (400): {wr.downloadHandler?.text}");
-                            yield break;
+                            break;
                         }
-                        else if (wr.responseCode == 503)
+                        if (retry && attempt < maxAttempts)
                         {
-                            // 引擎冷启动/正在换模型时会出现，稍后重试一次
-                            Logger.Warn($"[TTS] Server not ready (503): {wr.downloadHandler?.text}");
-                            retry = true;
+                            Logger.Info("[TTS] Retrying in 3s...");
+                            yield return new WaitForSeconds(3f);
+                            continue;
                         }
-                        else if (wr.responseCode == 0 || wr.result == UnityWebRequest.Result.ConnectionError)
+                        if (retry)
                         {
-                            Logger.Warn($"[TTS] Connection failed via {baseUrl}: {wr.error}");
-                            retry = true;
+                            nextCandidate = true;
                         }
-                        else
-                        {
-                            Logger.Warn($"[TTS] HTTP request FAILED (code={wr.responseCode}): {wr.error}");
-                            tryNextBase = true;
-                        }
+                        break;
                     }
 
-                    if (tryNextBase) break;
-                    if (retry && attempt < maxAttempts)
+                    if (played || fatal)
                     {
-                        Logger.Info("[TTS] Retrying in 3s...");
-                        yield return new WaitForSeconds(3f);
-                        continue;
+                        yield break;
                     }
-                    if (retry)
-                    {
-                        tryNextBase = true;
-                    }
-                    break;
+                    Logger.Warn($"[TTS] Request via {url} failed, trying fallback base URL if available");
                 }
-
-                if (!tryNextBase)
-                {
-                    yield break;
-                }
-                Logger.Warn($"[TTS] Base URL {baseUrl} failed, trying fallback if available");
             }
 
-            Logger.Warn("[TTS] All TTS base URLs failed");
+            Logger.Warn("[TTS] All TTS base URLs / engines failed");
         }
 
         // ── Audio Playback ────────────────────────────────────────
@@ -700,6 +726,67 @@ namespace EnhancedStreamChat.Chat
         }
 
         // ── Text Processing ───────────────────────────────────────
+
+        private static bool IsCompleteWav(byte[] d)
+        {
+            if (d == null || d.Length < 44) return false;
+            if (d[0] != 'R' || d[1] != 'I' || d[2] != 'F' || d[3] != 'F') return false;
+            if (d[8] != 'W' || d[9] != 'A' || d[10] != 'V' || d[11] != 'E') return false;
+
+            var off = 12;
+            while (off + 8 <= d.Length)
+            {
+                var id = Encoding.ASCII.GetString(d, off, 4);
+                var len = BitConverter.ToInt32(d, off + 4);
+                if (len < 0)
+                {
+                    if (id == "data" && len == unchecked((int)0xFFFFFFFF)) return true;
+                    return false;
+                }
+                if (id == "data")
+                {
+                    return (long)off + 8 + len <= d.Length;
+                }
+                var next = (long)off + 8 + len + (len & 1);
+                if (next <= off || next > d.Length) return false;
+                off = (int)next;
+            }
+            return false;
+        }
+
+        private static float GetWavDuration(byte[] d)
+        {
+            if (d == null || d.Length < 44) return 0f;
+            var off = 12;
+            var sampleRate = 0;
+            var channels = 0;
+            var bits = 0;
+            long dataLen = 0;
+
+            while (off + 8 <= d.Length)
+            {
+                var id = Encoding.ASCII.GetString(d, off, 4);
+                var len = BitConverter.ToInt32(d, off + 4);
+                if (id == "fmt " && len >= 16 && off + 24 <= d.Length)
+                {
+                    channels = BitConverter.ToInt16(d, off + 10);
+                    sampleRate = BitConverter.ToInt32(d, off + 12);
+                    bits = BitConverter.ToInt16(d, off + 22);
+                }
+                else if (id == "data")
+                {
+                    dataLen = Math.Min((long)len, d.Length - (off + 8));
+                    break;
+                }
+
+                var next = (long)off + 8 + len + (len & 1);
+                if (next <= off || next > d.Length) break;
+                off = (int)next;
+            }
+
+            var bytesPerSec = sampleRate * channels * (bits / 8);
+            return bytesPerSec > 0 ? (float)dataLen / bytesPerSec : 0f;
+        }
 
         private static string Truncate(string s, int max)
         {
