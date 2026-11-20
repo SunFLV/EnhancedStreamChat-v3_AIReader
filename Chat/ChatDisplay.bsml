@@ -7,7 +7,8 @@
           <text text='Enhanced Stream Chat v3' align='Center' font-size='8'/>
         </horizontal>-->
         <tab-selector tab-tag='settings-tab'></tab-selector>
-        <vertical pad-top='77'>
+        <vertical pad-top='77' spacing='4'>
+          <button text='测试朗读' click-event='test-speech'></button>
           <button text='关闭' click-event='hide-settings'></button>
         </vertical>
         <tab tags ='settings-tab' tab-name='布局'>

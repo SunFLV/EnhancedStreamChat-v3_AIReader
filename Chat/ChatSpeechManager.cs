@@ -1,4 +1,5 @@
 using EnhancedStreamChat.Interfaces;
+using Newtonsoft.Json;
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
@@ -41,6 +42,22 @@ namespace EnhancedStreamChat.Chat
 
         // ── HTTP ──────────────────────────────────────────────────
         private int _serverCount;
+        private string _activeBaseUrl;
+
+        private string ActiveBaseUrl =>
+            string.IsNullOrEmpty(_activeBaseUrl) ? ChatSpeechConfig.Instance.ServerBaseUrl : _activeBaseUrl;
+
+        private static string BuildUrl(string baseUrl, string path, bool appendServer, int serverIndex = -1, int serverCount = 0)
+        {
+            var url = (baseUrl ?? string.Empty).TrimEnd('/') + path;
+            if (appendServer && serverCount > 0)
+            {
+                var idx = serverIndex >= 0 ? serverIndex : 0;
+                if (idx < 0 || idx >= serverCount) idx = 0;
+                url += "?_srv=" + idx.ToString();
+            }
+            return url;
+        }
 
         // ── Regex for stripping rich text tags ────────────────────
         private static readonly Regex RichTextRegex = new Regex(
@@ -49,57 +66,51 @@ namespace EnhancedStreamChat.Chat
         );
 
         // ── JSON DTOs ─────────────────────────────────────────────
-        [Serializable]
         private class TTSRequestBody
         {
-            public string speaker;  // sender name (empty for system/test)
-            public string text;     // message content
-            public string voice;
-            public string version;  // empty = server default
-            public float speed;
+            [JsonProperty("speaker")] public string speaker;  // sender name (empty for system/test)
+            [JsonProperty("text")] public string text;        // message content
+            [JsonProperty("voice")] public string voice;
+            [JsonProperty("version")] public string version;  // empty = server default
+            [JsonProperty("speed")] public float speed;
         }
 
-        [Serializable]
         private class VoiceEntry
         {
-            public string name;
-            public string description;
+            [JsonProperty("name")] public string name;
+            [JsonProperty("description")] public string description;
         }
 
-        [Serializable]
         private class VersionEntry
         {
-            public string name;
-            public string label;
-            public int sample_steps;
+            [JsonProperty("name")] public string name;
+            [JsonProperty("label")] public string label;
+            [JsonProperty("sample_steps")] public int? sample_steps;
         }
 
-        [Serializable]
         private class VoiceListResponse
         {
-            public VoiceEntry[] voices;
-            public VersionEntry[] versions;
-            public string default_voice;
-            public string default_version;
-            public string server_name;
+            [JsonProperty("voices")] public VoiceEntry[] voices;
+            [JsonProperty("versions")] public VersionEntry[] versions;
+            [JsonProperty("default_voice")] public string default_voice;
+            [JsonProperty("default_version")] public string default_version;
+            [JsonProperty("server_name")] public string server_name;
         }
 
-        [Serializable]
         private class ServerEntry
         {
-            public string name;
-            public string url;
-            public string desc;
-            public string kind;
-            public string detail;
-            public bool engine;
+            [JsonProperty("name")] public string name;
+            [JsonProperty("url")] public string url;
+            [JsonProperty("desc")] public string desc;
+            [JsonProperty("kind")] public string kind;
+            [JsonProperty("detail")] public string detail;
+            [JsonProperty("engine")] public bool engine;
         }
 
-        [Serializable]
         private class ServerListResponse
         {
-            public ServerEntry[] servers;
-            public string current;
+            [JsonProperty("servers")] public ServerEntry[] servers;
+            [JsonProperty("current")] public string current;
         }
 
         // ── Unity Lifecycle ───────────────────────────────────────
@@ -177,7 +188,7 @@ namespace EnhancedStreamChat.Chat
 
             _speechQueue.Enqueue(msg);
             _pendingStart = true;
-            Logger.Debug($"[TTS] Enqueued message. Queue size: {_speechQueue.Count}");
+            Logger.Info($"[TTS] Enqueued: speaker=\"{StripRichText(msg.Sender?.DisplayName)}\" text=\"{StripRichText(msg.Message)}\" queue={_speechQueue.Count}");
         }
 
         public void Skip()
@@ -327,24 +338,46 @@ namespace EnhancedStreamChat.Chat
 
         private IEnumerator FetchServersCoroutine()
         {
-            var url = BuildUrl("/api/servers", false);
-            using (var wr = UnityWebRequest.Get(url))
+            foreach (var baseUrl in ChatSpeechConfig.Instance.GetBaseUrlCandidates())
             {
-                wr.timeout = 10;
-                wr.certificateHandler = new BypassCertificate();
-                yield return wr.SendWebRequest();
-
-                if (wr.result != UnityWebRequest.Result.Success)
+                var url = BuildUrl(baseUrl, "/api/servers", false);
+                string raw = null;
+                using (var wr = UnityWebRequest.Get(url))
                 {
-                    Logger.Warn($"[TTS] Could not fetch server list ({wr.responseCode}): {wr.error}");
-                    _serverCount = 0;
-                    yield break;
+                    wr.timeout = 10;
+                    wr.SetRequestHeader("Accept", "application/json");
+                    wr.certificateHandler = new BypassCertificate();
+                    yield return wr.SendWebRequest();
+
+                    if (wr.result == UnityWebRequest.Result.Success)
+                    {
+                        raw = wr.downloadHandler.text;
+                    }
+                    else
+                    {
+                        Logger.Warn($"[TTS] Could not fetch server list ({wr.responseCode}) from {url}: {wr.error}");
+                    }
                 }
 
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    Logger.Warn($"[TTS] Empty server list response from {url}, trying next base URL if any");
+                    continue;
+                }
+
+                var parsed = false;
                 try
                 {
-                    var data = JsonUtility.FromJson<ServerListResponse>(wr.downloadHandler.text);
-                    var servers = data?.servers ?? Array.Empty<ServerEntry>();
+                    Logger.Info($"[TTS] Servers response from {baseUrl}: bytes={raw.Length}, body=\"{Truncate(raw, 300)}\"");
+                    var data = JsonConvert.DeserializeObject<ServerListResponse>(raw);
+                    if (data?.servers == null)
+                    {
+                        Logger.Warn($"[TTS] Unexpected server list JSON from {url}");
+                        continue;
+                    }
+
+                    _activeBaseUrl = baseUrl;
+                    var servers = data.servers;
                     _serverCount = servers.Length;
 
                     var names = new List<string>();
@@ -363,57 +396,87 @@ namespace EnhancedStreamChat.Chat
                     }
                     ChatSpeechConfig.Instance.SpeechServerNames = string.Join("|", names.ToArray());
 
-                    if (ChatSpeechConfig.Instance.SpeechServerIndex >= _serverCount)
-                    {
-                        ChatSpeechConfig.Instance.SpeechServerIndex = 0;
-                    }
-                    if (ChatSpeechConfig.Instance.SpeechServerIndex < 0)
+                    if (ChatSpeechConfig.Instance.SpeechServerIndex >= _serverCount
+                        || ChatSpeechConfig.Instance.SpeechServerIndex < 0)
                     {
                         ChatSpeechConfig.Instance.SpeechServerIndex = 0;
                     }
                     ChatSpeechConfig.Instance.Save();
-                    Logger.Info($"[TTS] Loaded {_serverCount} backend server(s): {ChatSpeechConfig.Instance.SpeechServerNames}");
+                    Logger.Info($"[TTS] Loaded {_serverCount} backend server(s) via {baseUrl}: {ChatSpeechConfig.Instance.SpeechServerNames}");
+                    parsed = true;
                 }
                 catch (Exception e)
                 {
-                    Logger.Warn($"[TTS] Failed to parse server list: {e.Message}");
-                    _serverCount = 0;
+                    Logger.Warn($"[TTS] Failed to parse server list from {url}: {e.Message}");
+                }
+
+                if (parsed)
+                {
+                    yield break;
                 }
             }
+
+            _serverCount = 0;
+            Logger.Warn("[TTS] No reachable TTS server; check SpeechServerUrl / SpeechServerUrlAlt");
         }
 
         private IEnumerator FetchVoicesCoroutine()
         {
-            var url = BuildUrl("/api/voices", true);
-            using (var wr = UnityWebRequest.Get(url))
+            var candidates = new List<string> { ActiveBaseUrl };
+            foreach (var b in ChatSpeechConfig.Instance.GetBaseUrlCandidates())
             {
-                wr.timeout = 15;
-                wr.certificateHandler = new BypassCertificate();
-                yield return wr.SendWebRequest();
+                if (!candidates.Contains(b)) candidates.Add(b);
+            }
 
-                if (wr.result != UnityWebRequest.Result.Success)
+            foreach (var baseUrl in candidates)
+            {
+                var url = BuildUrl(baseUrl, "/api/voices", true, ChatSpeechConfig.Instance.SpeechServerIndex, _serverCount);
+                string raw = null;
+                using (var wr = UnityWebRequest.Get(url))
                 {
-                    Logger.Warn($"[TTS] Could not fetch voice list ({wr.responseCode}): {wr.error}");
-                    yield break;
+                    wr.timeout = 15;
+                    wr.SetRequestHeader("Accept", "application/json");
+                    wr.certificateHandler = new BypassCertificate();
+                    yield return wr.SendWebRequest();
+
+                    if (wr.result == UnityWebRequest.Result.Success)
+                    {
+                        raw = wr.downloadHandler.text;
+                    }
+                    else
+                    {
+                        Logger.Warn($"[TTS] Could not fetch voice list ({wr.responseCode}) from {url}: {wr.error}");
+                    }
                 }
 
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    Logger.Warn($"[TTS] Empty voice list response from {url}, trying next base URL if any");
+                    continue;
+                }
+
+                var parsed = false;
                 try
                 {
-                    var raw = wr.downloadHandler.text;
-                    var data = JsonUtility.FromJson<VoiceListResponse>(raw);
-                    var voiceNames = new List<string> { "default" };
-                    if (data?.voices != null)
+                    Logger.Info($"[TTS] Voices response from {baseUrl}: bytes={raw.Length}, body=\"{Truncate(raw, 300)}\"");
+                    var data = JsonConvert.DeserializeObject<VoiceListResponse>(raw);
+                    if (data?.voices == null)
                     {
-                        foreach (var v in data.voices)
+                        Logger.Warn($"[TTS] Unexpected voice list JSON from {url}");
+                        continue;
+                    }
+
+                    _activeBaseUrl = baseUrl;
+                    var voiceNames = new List<string> { "default" };
+                    foreach (var v in data.voices)
+                    {
+                        if (!string.IsNullOrEmpty(v.name) && !voiceNames.Contains(v.name))
                         {
-                            if (!string.IsNullOrEmpty(v.name) && !voiceNames.Contains(v.name))
-                            {
-                                voiceNames.Add(v.name);
-                            }
+                            voiceNames.Add(v.name);
                         }
                     }
                     var versionNames = new List<string>();
-                    if (data?.versions != null)
+                    if (data.versions != null)
                     {
                         foreach (var v in data.versions)
                         {
@@ -431,7 +494,7 @@ namespace EnhancedStreamChat.Chat
                     // 首次运行时采用服务器默认值
                     if (string.IsNullOrEmpty(cfg.SpeechVoice) || !voiceNames.Contains(cfg.SpeechVoice))
                     {
-                        cfg.SpeechVoice = !string.IsNullOrEmpty(data?.default_voice) && voiceNames.Contains(data.default_voice)
+                        cfg.SpeechVoice = !string.IsNullOrEmpty(data.default_voice) && voiceNames.Contains(data.default_voice)
                             ? data.default_voice
                             : (voiceNames.Count > 1 ? voiceNames[1] : "default");
                     }
@@ -441,12 +504,18 @@ namespace EnhancedStreamChat.Chat
                     }
                     cfg.Save();
 
-                    Logger.Info($"[TTS] Loaded {voiceNames.Count} voice(s): {cfg.SpeechVoices}");
+                    Logger.Info($"[TTS] Loaded {voiceNames.Count} voice(s) via {baseUrl}: {cfg.SpeechVoices}");
                     Logger.Info($"[TTS] Loaded {versionNames.Count} version(s): {cfg.SpeechVersions} (selected: \"{cfg.SpeechVersion}\")");
+                    parsed = true;
                 }
                 catch (Exception e)
                 {
-                    Logger.Warn($"[TTS] Failed to parse voice list: {e.Message}");
+                    Logger.Warn($"[TTS] Failed to parse voice list from {url}: {e.Message}");
+                }
+
+                if (parsed)
+                {
+                    yield break;
                 }
             }
         }
@@ -456,7 +525,6 @@ namespace EnhancedStreamChat.Chat
         private IEnumerator RequestAndPlayTTS(string speaker, string text)
         {
             var cfg = ChatSpeechConfig.Instance;
-            var url = BuildUrl("/api/tts", true, cfg.SpeechServerIndex);
 
             var ttsRequest = new TTSRequestBody
             {
@@ -466,98 +534,108 @@ namespace EnhancedStreamChat.Chat
                 version = cfg.SpeechVersion ?? string.Empty,
                 speed = Mathf.Clamp(cfg.SpeechSpeed, 0.5f, 2.0f)
             };
-            var jsonPayload = JsonUtility.ToJson(ttsRequest);
+            var jsonPayload = JsonConvert.SerializeObject(ttsRequest);
 
-            Logger.Info($"[TTS] Requesting: POST {url}");
-            Logger.Info($"[TTS] Payload: {jsonPayload}");
+            var bases = new List<string> { ActiveBaseUrl };
+            foreach (var b in cfg.GetBaseUrlCandidates())
+            {
+                if (!bases.Contains(b)) bases.Add(b);
+            }
 
             const int maxAttempts = 2;
-            for (var attempt = 1; attempt <= maxAttempts; attempt++)
+            foreach (var baseUrl in bases)
             {
-                var retry = false;
-                using (var wr = new UnityWebRequest(url, "POST"))
+                var url = BuildUrl(baseUrl, "/api/tts", true, cfg.SpeechServerIndex, _serverCount);
+                Logger.Info($"[TTS] Requesting: POST {url}");
+                Logger.Info($"[TTS] Payload: {jsonPayload}");
+
+                var tryNextBase = false;
+                for (var attempt = 1; attempt <= maxAttempts; attempt++)
                 {
-                    wr.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(jsonPayload));
-                    wr.downloadHandler = new DownloadHandlerBuffer();
-                    wr.SetRequestHeader("Content-Type", "application/json");
-                    wr.SetRequestHeader("Accept", "audio/wav, application/json");
-                    wr.timeout = 300; // 冷启动推理可能需要 100s 以上
-                    wr.certificateHandler = new BypassCertificate();
-
-                    yield return wr.SendWebRequest();
-
-                    Logger.Info($"[TTS] HTTP response: code={wr.responseCode}, result={wr.result}, version={wr.GetResponseHeader("x-tts-version")} (attempt {attempt}/{maxAttempts})");
-
-                    if (wr.result == UnityWebRequest.Result.Success)
+                    var retry = false;
+                    using (var wr = new UnityWebRequest(url, "POST"))
                     {
-                        var audioData = wr.downloadHandler.data;
-                        var contentType = wr.GetResponseHeader("Content-Type") ?? "unknown";
-                        if (audioData != null && audioData.Length > 0)
+                        wr.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(jsonPayload));
+                        wr.downloadHandler = new DownloadHandlerBuffer();
+                        wr.SetRequestHeader("Content-Type", "application/json");
+                        wr.SetRequestHeader("Accept", "audio/wav, application/json");
+                        wr.timeout = 300; // 冷启动推理可能需要 100s 以上
+                        wr.certificateHandler = new BypassCertificate();
+
+                        yield return wr.SendWebRequest();
+
+                        Logger.Info($"[TTS] HTTP response: code={wr.responseCode}, result={wr.result}, version={wr.GetResponseHeader("x-tts-version")} (attempt {attempt}/{maxAttempts})");
+
+                        if (wr.result == UnityWebRequest.Result.Success)
                         {
-                            if (contentType.Contains("json") || (audioData.Length < 256 && audioData[0] == (byte)'{'))
+                            var audioData = wr.downloadHandler.data;
+                            var contentType = wr.GetResponseHeader("Content-Type") ?? "unknown";
+                            if (audioData != null && audioData.Length > 0)
                             {
-                                Logger.Warn($"[TTS] Server returned JSON instead of audio: {Encoding.UTF8.GetString(audioData)}");
+                                if (contentType.Contains("json") || (audioData.Length < 256 && audioData[0] == (byte)'{'))
+                                {
+                                    Logger.Warn($"[TTS] Server returned JSON instead of audio: {Encoding.UTF8.GetString(audioData)}");
+                                    tryNextBase = true;
+                                }
+                                else
+                                {
+                                    _activeBaseUrl = baseUrl;
+                                    Logger.Info($"[TTS] Received {audioData.Length} bytes ({contentType}) via {baseUrl}, playing...");
+                                    yield return StartCoroutine(PlayAudioFromBytes(audioData));
+                                    yield break;
+                                }
                             }
                             else
                             {
-                                Logger.Info($"[TTS] Received {audioData.Length} bytes ({contentType}), playing...");
-                                yield return StartCoroutine(PlayAudioFromBytes(audioData));
+                                Logger.Warn($"[TTS] Server returned empty audio data via {baseUrl}");
+                                tryNextBase = true;
                             }
+                        }
+                        else if (wr.responseCode == 400)
+                        {
+                            Logger.Warn($"[TTS] Server rejected text (400): {wr.downloadHandler?.text}");
+                            yield break;
+                        }
+                        else if (wr.responseCode == 503)
+                        {
+                            // 引擎冷启动/正在换模型时会出现，稍后重试一次
+                            Logger.Warn($"[TTS] Server not ready (503): {wr.downloadHandler?.text}");
+                            retry = true;
+                        }
+                        else if (wr.responseCode == 0 || wr.result == UnityWebRequest.Result.ConnectionError)
+                        {
+                            Logger.Warn($"[TTS] Connection failed via {baseUrl}: {wr.error}");
+                            retry = true;
                         }
                         else
                         {
-                            Logger.Warn("[TTS] Server returned empty audio data");
+                            Logger.Warn($"[TTS] HTTP request FAILED (code={wr.responseCode}): {wr.error}");
+                            tryNextBase = true;
                         }
-                        yield break;
                     }
 
-                    if (wr.responseCode == 400)
+                    if (tryNextBase) break;
+                    if (retry && attempt < maxAttempts)
                     {
-                        Logger.Warn($"[TTS] Server rejected text (400): {wr.downloadHandler?.text}");
-                        yield break;
+                        Logger.Info("[TTS] Retrying in 3s...");
+                        yield return new WaitForSeconds(3f);
+                        continue;
                     }
-
-                    if (wr.responseCode == 503)
+                    if (retry)
                     {
-                        // 引擎冷启动/正在换模型时会出现，稍后重试一次
-                        Logger.Warn($"[TTS] Server not ready (503): {wr.downloadHandler?.text}");
-                        retry = true;
+                        tryNextBase = true;
                     }
-                    else if (wr.responseCode == 0 || wr.result == UnityWebRequest.Result.ConnectionError)
-                    {
-                        Logger.Warn($"[TTS] Connection failed: {wr.error}");
-                        retry = true;
-                    }
-                    else
-                    {
-                        Logger.Warn($"[TTS] HTTP request FAILED (code={wr.responseCode}): {wr.error}");
-                        yield break;
-                    }
+                    break;
                 }
 
-                if (retry && attempt < maxAttempts)
+                if (!tryNextBase)
                 {
-                    Logger.Info("[TTS] Retrying in 3s...");
-                    yield return new WaitForSeconds(3f);
-                    continue;
+                    yield break;
                 }
-                yield break;
+                Logger.Warn($"[TTS] Base URL {baseUrl} failed, trying fallback if available");
             }
-        }
 
-        /// <summary>
-        /// 拼接请求 URL。appendServer=true 时附加 ?_srv=&lt;下标&gt; 指定合成后端。
-        /// </summary>
-        private string BuildUrl(string path, bool appendServer, int serverIndex = -1)
-        {
-            var url = ChatSpeechConfig.Instance.ServerBaseUrl.TrimEnd('/') + path;
-            if (appendServer && _serverCount > 0)
-            {
-                var idx = serverIndex >= 0 ? serverIndex : ChatSpeechConfig.Instance.SpeechServerIndex;
-                if (idx < 0 || idx >= _serverCount) idx = 0;
-                url += "?_srv=" + idx.ToString();
-            }
-            return url;
+            Logger.Warn("[TTS] All TTS base URLs failed");
         }
 
         // ── Audio Playback ────────────────────────────────────────
@@ -622,6 +700,12 @@ namespace EnhancedStreamChat.Chat
         }
 
         // ── Text Processing ───────────────────────────────────────
+
+        private static string Truncate(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s) || s.Length <= max) return s;
+            return s.Substring(0, max) + "...";
+        }
 
         internal static string StripRichText(string message)
         {

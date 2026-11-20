@@ -27,37 +27,44 @@ namespace EnhancedStreamChat.Chat
         public static void NotifyListsUpdated() => ListsUpdated?.Invoke();
 
         // ── Speech ────────────────────────────────────────────────
-        public bool SpeechEnabled = false;
+        // 2026-11-20 默认值取自 SunFLV 当前正在使用的语音设置
+        public bool SpeechEnabled = true;
 
         /// <summary>TTS 服务器根地址，例如 https://6.sunflv.top:8000 。</summary>
         public string SpeechServerUrl = "https://6.sunflv.top:8000";
+
+        /// <summary>
+        /// 备用根地址。6.sunflv.top 只有 IPv6 记录，游戏内 UnityWebRequest 可能拿到空响应；
+        /// 旧地址 ai.sunflv.top:39281 有 IPv4 且是同一套后端，主地址失败时自动回退到这里。
+        /// </summary>
+        public string SpeechServerUrlAlt = "https://ai.sunflv.top:39281";
 
         /// <summary>备用服务器列表（逗号分隔，仅在无法访问服务器时作为提示/手动填写用）。</summary>
         public string SpeechServerUrls = "6.sunflv.top:8000";
 
         /// <summary>声音预设名。</summary>
-        public string SpeechVoice = "default";
+        public string SpeechVoice = "v4_phone";
 
         /// <summary>可选声音（逗号分隔，服务器返回后自动写入）。</summary>
-        public string SpeechVoices = "default";
+        public string SpeechVoices = "default,v4_default,v4_tomori,v4_anon,v4_taki,v4_rana,v4_soyo,v4_phone,v4_sunflv";
 
         /// <summary>模型版本名；空字符串表示使用服务器默认版本。</summary>
-        public string SpeechVersion = "";
+        public string SpeechVersion = "v5turbo";
 
         /// <summary>可选模型版本（逗号分隔，服务器返回后自动写入）。</summary>
-        public string SpeechVersions = "";
+        public string SpeechVersions = "v4,v5turbo";
 
         /// <summary>后端服务器下标（对应 /api/servers 的 servers 数组）。</summary>
-        public int SpeechServerIndex = 0;
+        public int SpeechServerIndex = 2;
 
         /// <summary>后端服务器显示名（“|”分隔，服务器返回后自动写入，顺序与下标一致）。</summary>
-        public string SpeechServerNames = "";
+        public string SpeechServerNames = "本机 A770|9070XT (streaming6) ✕不可达|P106-90 fp16 (CUDA) ⚡";
 
         /// <summary>朗读过滤：0=全部，1=仅高亮/提及，2=仅礼物/醒目留言。</summary>
         public int SpeechFilterMode = 0;
 
         /// <summary>朗读音量（0.0 ~ 2.0，超过 1.0 由客户端增益实现）。</summary>
-        public float SpeechVolume = 0.8f;
+        public float SpeechVolume = 1.75f;
 
         /// <summary>朗读语速（0.5 ~ 2.0）。</summary>
         public float SpeechSpeed = 1.0f;
@@ -83,26 +90,8 @@ namespace EnhancedStreamChat.Chat
         {
             get
             {
-                var raw = (this.SpeechServerUrl ?? string.Empty).Trim();
-                if (raw.Length == 0)
-                {
-                    raw = "https://6.sunflv.top:8000";
-                }
-                if (!raw.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-                    && !raw.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                {
-                    raw = "https://" + raw;
-                }
-                raw = raw.TrimEnd('/');
-                if (raw.EndsWith("/api/tts", StringComparison.OrdinalIgnoreCase))
-                {
-                    raw = raw.Substring(0, raw.Length - "/api/tts".Length);
-                }
-                else if (raw.EndsWith("/api", StringComparison.OrdinalIgnoreCase))
-                {
-                    raw = raw.Substring(0, raw.Length - "/api".Length);
-                }
-                return raw.TrimEnd('/');
+                var raw = NormalizeBase(this.SpeechServerUrl);
+                return raw.Length == 0 ? "https://6.sunflv.top:8000" : raw;
             }
         }
 
@@ -115,6 +104,39 @@ namespace EnhancedStreamChat.Chat
                 list.Insert(0, "default");
             }
             return list;
+        }
+
+        /// <summary>主地址 + 备用地址（去重、规范化）。</summary>
+        public List<string> GetBaseUrlCandidates()
+        {
+            var list = new List<string>();
+            var primary = NormalizeBase(this.SpeechServerUrl);
+            if (!string.IsNullOrEmpty(primary)) list.Add(primary);
+            var alt = NormalizeBase(this.SpeechServerUrlAlt);
+            if (!string.IsNullOrEmpty(alt) && !list.Contains(alt)) list.Add(alt);
+            if (list.Count == 0) list.Add("https://ai.sunflv.top:39281");
+            return list;
+        }
+
+        public static string NormalizeBase(string raw)
+        {
+            raw = (raw ?? string.Empty).Trim();
+            if (raw.Length == 0) return string.Empty;
+            if (!raw.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                && !raw.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                raw = "https://" + raw;
+            }
+            raw = raw.TrimEnd('/');
+            if (raw.EndsWith("/api/tts", StringComparison.OrdinalIgnoreCase))
+            {
+                raw = raw.Substring(0, raw.Length - "/api/tts".Length);
+            }
+            else if (raw.EndsWith("/api", StringComparison.OrdinalIgnoreCase))
+            {
+                raw = raw.Substring(0, raw.Length - "/api".Length);
+            }
+            return raw.TrimEnd('/');
         }
 
         public List<string> GetVersionList()
@@ -181,22 +203,12 @@ namespace EnhancedStreamChat.Chat
                     this.Apply(key, value);
                 }
 
-                // 旧配置迁移：旧地址已废弃，统一切到新后端
-                var migrated = false;
-                if (!string.IsNullOrEmpty(this.SpeechServerUrl)
-                    && this.SpeechServerUrl.IndexOf("ai.sunflv.top", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (string.IsNullOrWhiteSpace(this.SpeechServerUrlAlt))
                 {
-                    this.SpeechServerUrl = "https://6.sunflv.top:8000";
-                    this.SpeechServerUrls = "6.sunflv.top:8000";
-                    migrated = true;
-                }
-                if (migrated)
-                {
-                    this.Save();
-                    Logger.Info("[TTS] Migrated legacy TTS server URL to https://6.sunflv.top:8000");
+                    this.SpeechServerUrlAlt = "https://ai.sunflv.top:39281";
                 }
 
-                Logger.Info($"[TTS] Speech config loaded: {_path}");
+                Logger.Info($"[TTS] Speech config loaded: {_path} (primary={this.ServerBaseUrl}, alt={this.SpeechServerUrlAlt})");
             }
             catch (Exception e)
             {
@@ -235,6 +247,7 @@ namespace EnhancedStreamChat.Chat
             {
                 case nameof(this.SpeechEnabled): this.SpeechEnabled = ParseBool(value, this.SpeechEnabled); break;
                 case nameof(this.SpeechServerUrl): this.SpeechServerUrl = value; break;
+                case nameof(this.SpeechServerUrlAlt): this.SpeechServerUrlAlt = value; break;
                 case nameof(this.SpeechServerUrls): this.SpeechServerUrls = value; break;
                 case nameof(this.SpeechVoice): this.SpeechVoice = value; break;
                 case nameof(this.SpeechVoices): this.SpeechVoices = value; break;
@@ -262,6 +275,7 @@ namespace EnhancedStreamChat.Chat
                 sb.AppendLine($"[{SectionName}]");
                 sb.AppendLine($"{nameof(this.SpeechEnabled)}={this.SpeechEnabled.ToString().ToLowerInvariant()}");
                 sb.AppendLine($"{nameof(this.SpeechServerUrl)}={this.SpeechServerUrl}");
+                sb.AppendLine($"{nameof(this.SpeechServerUrlAlt)}={this.SpeechServerUrlAlt}");
                 sb.AppendLine($"{nameof(this.SpeechServerUrls)}={this.SpeechServerUrls}");
                 sb.AppendLine($"{nameof(this.SpeechVoice)}={this.SpeechVoice}");
                 sb.AppendLine($"{nameof(this.SpeechVoices)}={this.SpeechVoices}");

@@ -168,6 +168,7 @@ namespace EnhancedStreamChat.Chat
             ChatSpeechConfig.ListsUpdated -= this.UpdateSpeechChoices;
             ChatSpeechConfig.ListsUpdated += this.UpdateSpeechChoices;
             this.UpdateSpeechChoices();
+            this.WireTestSpeechButton();
             ChatSpeechManager.Instance?.RefreshVoices();
         }
 
@@ -642,17 +643,52 @@ namespace EnhancedStreamChat.Chat
             }
         }
 
+        private float _lastTestSpeechTime = -10f;
+
         [UIAction("test-speech")]
-        private void TestSpeech()
+        public void TestSpeech()
         {
+            // BSML click-event 与手动绑定的 Button 可能同时触发，做一次去抖
+            if (Time.unscaledTime - this._lastTestSpeechTime < 0.5f)
+            {
+                return;
+            }
+            this._lastTestSpeechTime = Time.unscaledTime;
+
             Logger.Info("[TTS] Test speech button clicked");
-            ChatSpeechManager.Instance?.TestSpeech("欢迎来到直播间，AI语音朗读已就绪");
+            var mgr = ChatSpeechManager.Instance;
+            if (mgr == null)
+            {
+                Logger.Error("[TTS] ChatSpeechManager.Instance is null");
+                return;
+            }
+            mgr.TestSpeech("欢迎来到直播间，AI语音朗读已就绪");
         }
 
         [UIAction("refresh-speech")]
-        private void RefreshSpeech()
+        public void RefreshSpeech()
         {
+            Logger.Info("[TTS] Refresh speech button clicked");
             ChatSpeechManager.Instance?.RefreshVoices();
+        }
+
+        /// <summary>
+        /// 旧版 BSML 在部分版本里 click-event 绑定不稳定，这里再按文本找按钮手动接一次。
+        /// </summary>
+        private void WireTestSpeechButton()
+        {
+            if (this._settingsModalGameObject == null) return;
+            foreach (var btn in this._settingsModalGameObject.GetComponentsInChildren<Button>(true))
+            {
+                var label = btn.GetComponentInChildren<TMPro.TextMeshProUGUI>();
+                if (label != null && label.text != null && label.text.Contains("测试朗读"))
+                {
+                    btn.onClick.AddListener(this.TestSpeech);
+                    Logger.Info("[TTS] Test speech button wired directly");
+                    return;
+                }
+            }
+            Logger.Warn("[TTS] Test speech button not found for direct wiring");
         }
 
         [UIComponent("speech-voice-setting")]

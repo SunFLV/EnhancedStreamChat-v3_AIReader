@@ -3,6 +3,15 @@
 基于 [lyyQwQ/EnhancedStreamChat-v3](https://github.com/lyyQwQ/EnhancedStreamChat-v3)（上游 `dev/catcore` / `main`）
 二次开发，在 **CatCore 架构** 的弹幕板上接入了 GPT-SoVITS TTS 后端。
 
+## 10.2.0 更新
+
+- 更新 CatCore 到 2026-09 构建（修复 B 站扫码登录 Cookie 提取）
+- TTS 服务器支持 IPv4 回退：`6.sunflv.top` 只有 IPv6，游戏内请求为空时自动切到
+  `ai.sunflv.top:39281`（同一套后端）
+- 音色/版本 JSON 解析改用 Newtonsoft，兼容 `sample_steps: null`
+- 修复设置页「测试朗读 / 刷新列表」按钮
+- 默认语音设置：`v4_phone` + `v5turbo` + P106 后端 + 音量 1.75
+
 - 弹幕板：上游 10.1.0（CatCore 架构，包含上游的 BUG 修复与 Bilibili 徽章渲染改进）
 - 朗读：AI 弹幕朗读（GPT-SoVITS / AI TTS Proxy v3）
 - 目标游戏版本：Beat Saber **1.40.4**（`net48`）
@@ -48,20 +57,21 @@ Beat Saber (mod) ──HTTPS──▶ AI TTS Proxy (6.sunflv.top:8000)
 [Speech]
 SpeechEnabled=true
 SpeechServerUrl=https://6.sunflv.top:8000
+SpeechServerUrlAlt=https://ai.sunflv.top:39281
 SpeechServerUrls=6.sunflv.top:8000
-SpeechVoice=v4_sunflv
+SpeechVoice=v4_phone
 SpeechVoices=default,v4_default,v4_tomori,v4_anon,v4_taki,v4_rana,v4_soyo,v4_phone,v4_sunflv
-SpeechVersion=
-SpeechVersions=v5turbo
-SpeechServerIndex=0
-SpeechServerNames=本机 A770|9070XT (streaming6)|P106-90 fp16 (CUDA)
+SpeechVersion=v5turbo
+SpeechVersions=v4,v5turbo
+SpeechServerIndex=2
+SpeechServerNames=本机 A770|9070XT (streaming6) ✕不可达|P106-90 fp16 (CUDA) ⚡
 SpeechFilterMode=0
-SpeechVolume=1.00
+SpeechVolume=1.75
 SpeechSpeed=1.00
 SpeechMaxQueueSize=10
 ```
 
-旧版配置（`//` 行内注释、引号包裹、`ai.sunflv.top` 地址）会自动兼容并迁移到新地址。
+以上也是 10.2.0 的内置默认值（没有配置文件时生效）。旧版配置的 `//` 行内注释、引号包裹会自动兼容。
 
 ## TTS 请求接口
 
