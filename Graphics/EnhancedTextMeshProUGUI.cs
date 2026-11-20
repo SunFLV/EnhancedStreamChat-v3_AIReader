@@ -1,301 +1,559 @@
-﻿using BeatSaberMarkupLanguage.Animations;
-using ChatCore.Interfaces;
 using EnhancedStreamChat.Chat;
+using EnhancedStreamChat.Interfaces;
 using EnhancedStreamChat.Utilities;
+using BeatSaberMarkupLanguage;
 using System;
-using System.Collections.Concurrent;
-using System.Reflection;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using TMPro;
+using Unity.Profiling;
 using UnityEngine;
 using UnityEngine.UI;
+using Zenject;
 
 namespace EnhancedStreamChat.Graphics
 {
     public class EnhancedTextMeshProUGUI : TextMeshProUGUI
     {
-        public IChatMessage ChatMessage { get; set; } = null;
-        public EnhancedFontInfo FontInfo { get; private set; }
-        public event Action OnLatePreRenderRebuildComplete;
+        public IESCChatMessage ChatMessage { get; set; } = null;
+        public EnhancedFontInfo FontInfo => this._fontManager.FontInfo;
 
-        private static readonly ObjectMemoryComponentPool<EnhancedImage> _imagePool =
-            new ObjectMemoryComponentPool<EnhancedImage>(64,
-                constructor: () =>
-                {
-                    var img = new GameObject().AddComponent<EnhancedImage>();
-                    DontDestroyOnLoad(img.gameObject);
-                    img.gameObject.SetActive(false);
-                    img.raycastTarget = false;
-                    img.color = Color.white;
-                    img.rectTransform.anchorMin = new Vector2(0.5f, 0.5f);
-                    img.rectTransform.anchorMax = new Vector2(0.5f, 0.5f);
-                    img.rectTransform.pivot = new Vector2(0, 0);
-                    img.animStateUpdater = img.gameObject.AddComponent<AnimationStateUpdater>();
-                    img.animStateUpdater.Image = img;
-                    img.SetAllDirty();
-                    return img;
-                },
-                onFree: img =>
-                {
-                    try
-                    {
-                        img.gameObject.SetActive(false);
-                        img.animStateUpdater.ControllerData = null;
-                        img.rectTransform.SetParent(null);
-                        img.sprite = null;
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Error(
-                            $"Exception while freeing EnhancedImage in EnhancedTextMeshProUGUI. {ex.ToString()}");
-                    }
-                }
-            );
+        private MemoryPoolContainer<EnhancedImage> _imagePool;
+        private ESCFontManager _fontManager;
+        private bool _rebuiled = false;
+        private readonly LazyCopyHashSet<ILatePreRenderRebuildReciver> _recivers = new LazyCopyHashSet<ILatePreRenderRebuildReciver>();
+        public ILazyCopyHashSet<ILatePreRenderRebuildReciver> LazyCopyHashSet => this._recivers;
+
+        private const string BilibiliAvatarImageIdPrefix = "Bili_avatar_";
+        private const float DefaultImageScaleMultiplier = 1.08f;
+        private const float DefaultImageVerticalOffsetFactor = 0.558f;
+        private const float MetadataImageScaleMultiplier = 0.92f;
+        private const float MetadataImageBaselineOffsetFactor = 0.18f;
+        private const float BroadcasterImageScaleMultiplier = 0.88f;
+        private const float BroadcasterImageBaselineOffsetFactor = 0.28f;
+        private readonly Dictionary<EnhancedImage, RectTransform> _avatarMaskWrappersByImage = new Dictionary<EnhancedImage, RectTransform>();
+        private readonly Stack<RectTransform> _avatarMaskWrapperPool = new Stack<RectTransform>();
+        private static readonly ProfilerMarker BadgeRebuildProfilerMarker = new ProfilerMarker("ESC.BadgeRebuild");
+
+#if DEBUG
+        private static readonly BadgePerfAggregator s_badgePerfAggregator = new BadgePerfAggregator();
+#endif
+
+#if BADGE_DEBUG
+        private static long s_nextTask14DebugLogTicks;
+#endif
+
+        private static readonly object s_avatarMaskLock = new object();
+        private static Sprite s_avatarCircleMaskSprite;
+        private static TMP_FontAsset s_bootstrapFont;
+
+        public void Constract(EnhancedImage.Pool image, ESCFontManager fontManager)
+        {
+            this._imagePool = new MemoryPoolContainer<EnhancedImage>(image);
+            this._fontManager = fontManager;
+        }
 
         protected override void Awake()
         {
             base.Awake();
-            this.FontInfo = ESCFontManager.instance.FontInfo;
-            // Logger.Debug($"FontInfo: {this.FontInfo}");
             this.raycastTarget = false;
+            if (!this.font) {
+                this.font = GetBootstrapFont();
+            }
+        }
+
+        private static TMP_FontAsset GetBootstrapFont()
+        {
+            if (s_bootstrapFont) {
+                return s_bootstrapFont;
+            }
+
+            s_bootstrapFont = BeatSaberUI.MainTextFont != null ? BeatSaberUI.MainTextFont : TMP_Settings.defaultFontAsset;
+            if (s_bootstrapFont) {
+                return s_bootstrapFont;
+            }
+
+            s_bootstrapFont = Resources.FindObjectsOfTypeAll<TMP_FontAsset>()
+                .FirstOrDefault(font => font != null && (font.atlasTexture != null || (font.atlasTextures != null && font.atlasTextures.Any(texture => texture != null))));
+
+            return s_bootstrapFont;
+        }
+
+        private static Sprite GetOrCreateAvatarCircleMaskSprite()
+        {
+            lock (s_avatarMaskLock) {
+                if (s_avatarCircleMaskSprite != null) {
+                    return s_avatarCircleMaskSprite;
+                }
+
+                const int size = 64;
+                var texture = new Texture2D(size, size, TextureFormat.ARGB32, false)
+                {
+                    filterMode = FilterMode.Bilinear,
+                    wrapMode = TextureWrapMode.Clamp,
+                    name = "ESC_AvatarCircleMask"
+                };
+
+                var pixels = new Color32[size * size];
+                var center = new Vector2((size - 1) * 0.5f, (size - 1) * 0.5f);
+                var radius = (size - 1) * 0.5f;
+
+                for (var y = 0; y < size; y++) {
+                    for (var x = 0; x < size; x++) {
+                        var dx = x - center.x;
+                        var dy = y - center.y;
+                        var dist = Mathf.Sqrt(dx * dx + dy * dy);
+                        var alpha01 = Mathf.Clamp01(radius - dist);
+                        var a = (byte)Mathf.RoundToInt(alpha01 * 255f);
+                        pixels[(y * size) + x] = new Color32(255, 255, 255, a);
+                    }
+                }
+
+                texture.SetPixels32(pixels);
+                texture.Apply(false, true);
+                texture.hideFlags = HideFlags.HideAndDontSave;
+
+                s_avatarCircleMaskSprite = Sprite.Create(texture, new Rect(0, 0, size, size), new Vector2(0.5f, 0.5f), 100f, 0u, SpriteMeshType.FullRect);
+                s_avatarCircleMaskSprite.hideFlags = HideFlags.HideAndDontSave;
+                return s_avatarCircleMaskSprite;
+            }
+        }
+
+        private RectTransform RentAvatarMaskWrapper()
+        {
+            RectTransform wrapper;
+            if (this._avatarMaskWrapperPool.Count > 0) {
+                wrapper = this._avatarMaskWrapperPool.Pop();
+                if (wrapper != null) {
+                    wrapper.gameObject.SetActive(true);
+                    return wrapper;
+                }
+            }
+
+            var go = new GameObject("ESC_AvatarMask", typeof(RectTransform), typeof(Image), typeof(Mask));
+            go.layer = this.gameObject.layer;
+
+            wrapper = go.GetComponent<RectTransform>();
+            wrapper.SetParent(this.rectTransform, false);
+            wrapper.anchorMin = new Vector2(0.5f, 0.5f);
+            wrapper.anchorMax = new Vector2(0.5f, 0.5f);
+            wrapper.pivot = new Vector2(0, 0);
+
+            var maskImage = go.GetComponent<Image>();
+            maskImage.raycastTarget = false;
+            maskImage.color = Color.white;
+            maskImage.sprite = GetOrCreateAvatarCircleMaskSprite();
+
+            var mask = go.GetComponent<Mask>();
+            mask.showMaskGraphic = false;
+
+            return wrapper;
+        }
+
+        private void ReturnAvatarMaskWrapper(RectTransform wrapper)
+        {
+            if (wrapper == null) {
+                return;
+            }
+
+            try {
+                for (var i = wrapper.childCount - 1; i >= 0; i--) {
+                    wrapper.GetChild(i).SetParent(this.rectTransform, false);
+                }
+                wrapper.gameObject.SetActive(false);
+                this._avatarMaskWrapperPool.Push(wrapper);
+            }
+            catch (Exception e) {
+                Logger.Error(e);
+            }
+        }
+
+        private bool IsBilibiliAvatar(EnhancedImageInfo imageInfo)
+        {
+            return imageInfo?.ImageId?.StartsWith(BilibiliAvatarImageIdPrefix, StringComparison.Ordinal) == true;
+        }
+
+        private static bool IsBroadcasterPrefixImage(EnhancedImageInfo imageInfo)
+        {
+            return imageInfo?.ImageId?.IndexOf("_broadcaster_", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private bool IsBilibiliMetadataImage(EnhancedImageInfo imageInfo)
+        {
+            var imageId = imageInfo?.ImageId;
+            return !string.IsNullOrEmpty(imageId)
+                && imageId.StartsWith("Bili_", StringComparison.OrdinalIgnoreCase)
+                && !this.IsBilibiliAvatar(imageInfo);
+        }
+
+        private static ImageLayoutMetrics GetImageLayoutMetrics(EnhancedImageInfo imageInfo, bool isAvatar, bool isMetadata, bool isBroadcaster)
+        {
+            if (isAvatar) {
+                return new ImageLayoutMetrics(DefaultImageScaleMultiplier, DefaultImageVerticalOffsetFactor, useBaselinePosition: false);
+            }
+
+            if (isBroadcaster) {
+                return new ImageLayoutMetrics(BroadcasterImageScaleMultiplier, BroadcasterImageBaselineOffsetFactor, useBaselinePosition: true);
+            }
+
+            if (isMetadata) {
+                return new ImageLayoutMetrics(MetadataImageScaleMultiplier, MetadataImageBaselineOffsetFactor, useBaselinePosition: true);
+            }
+
+            return new ImageLayoutMetrics(DefaultImageScaleMultiplier, DefaultImageVerticalOffsetFactor, useBaselinePosition: false);
+        }
+
+        private static Vector3 GetImageLocalPosition(TMP_CharacterInfo characterInfo, EnhancedImageInfo imageInfo, float scaledFontFactor, ImageLayoutMetrics metrics)
+        {
+            var scaledHeight = imageInfo.Height * scaledFontFactor * metrics.ScaleMultiplier;
+            if (metrics.UseBaselinePosition) {
+                return new Vector3(characterInfo.origin, characterInfo.baseLine - (scaledHeight * metrics.VerticalOffsetFactor), 0f);
+            }
+
+            return characterInfo.topLeft - new Vector3(0f, imageInfo.Height * scaledFontFactor * metrics.VerticalOffsetFactor / 2f);
+        }
+
+        private void DespawnImage(EnhancedImage img)
+        {
+            if (img == null) {
+                return;
+            }
+
+            this._imagePool?.Despawn(img);
+
+            if (this._avatarMaskWrappersByImage.TryGetValue(img, out var wrapper)) {
+                this._avatarMaskWrappersByImage.Remove(img);
+                this.ReturnAvatarMaskWrapper(wrapper);
+            }
         }
 
         public void ClearImages()
         {
-            while (this._currentImages.TryTake(out var image))
-            {
-                _imagePool.Free(image);
+            try {
+                while (this._imagePool?.activeItems != null && this._imagePool?.activeItems.Any() == true) {
+                    this.DespawnImage(this._imagePool.activeItems[0]);
+                }
+            }
+            catch (Exception e) {
+                Logger.Error(e);
             }
         }
 
-        private readonly ConcurrentBag<EnhancedImage> _currentImages = new ConcurrentBag<EnhancedImage>();
-
-        // public override void Rebuild(CanvasUpdate update)
-        // {
-        //     Logger.Debug($"Into EnhancedTextMeshProUGUI.Rebuild, update: {update}");
-        //     if (update == CanvasUpdate.LatePreRender) {
-        //         MainThreadInvoker.Invoke(() =>
-        //         {
-        //             Logger.Debug("Clearing images...");
-        //             this.ClearImages();
-        //             Logger.Debug("Images cleared.");
-        //         });
-        //         Logger.Debug("Rebuilding images...");
-        //         for (var i = 0; i < this.textInfo.characterCount; i++) {
-        //             var c = this.textInfo.characterInfo[i];
-        //             if (!c.isVisible || string.IsNullOrEmpty(this.text) || c.index >= this.text.Length) {
-        //                 // Skip invisible/empty/out of range chars
-        //                 Logger.Debug($"Skipping character: {this.text[c.index]}, isVisible: {c.isVisible}, text: {this.text}, index: {c.index}, textLength: {this.text.Length}");
-        //                 continue;
-        //             }
-        //
-        //             Logger.Debug($"Processing character: {this.text[c.index]}");
-        //             uint character = this.text[c.index];
-        //             if (c.index + 1 < this.text.Length && char.IsSurrogatePair(this.text[c.index], this.text[c.index + 1])) {
-        //                 // If it's a surrogate pair, convert the character
-        //                 Logger.Debug($"Character is a surrogate pair.");
-        //                 character = (uint)char.ConvertToUtf32(this.text[c.index], this.text[c.index + 1]);
-        //                 Logger.Debug($"Converted character: {character}");
-        //             }
-        //
-        //             if (this.FontInfo == null || !this.FontInfo.TryGetImageInfo(character, out var imageInfo) || imageInfo is null) {
-        //                 // Skip characters that have no imageInfo registered
-        //                 Logger.Debug($"No imageInfo found for character: {this.text[c.index]}");
-        //                 continue;
-        //             }
-        //
-        //             Logger.Debug($"Found imageInfo for character: {this.text[c.index]}");
-        //             MainThreadInvoker.Invoke(() =>
-        //             {
-        //                 var img = _imagePool.Alloc();
-        //                 try {
-        //                     Logger.Debug($"Overlaying sprite for character: {this.text[c.index]}");
-        //                     if (imageInfo.AnimControllerData != null) {
-        //                         Logger.Debug($"Overlaying animated sprite for character: {this.text[c.index]}");
-        //                         img.animStateUpdater.controllerData = imageInfo.AnimControllerData;
-        //                         img.sprite = imageInfo.AnimControllerData.sprites[imageInfo.AnimControllerData.uvIndex];
-        //                     }
-        //                     else {
-        //                         Logger.Debug($"Overlaying static sprite for character: {this.text[c.index]}");
-        //                         img.sprite = imageInfo.Sprite;
-        //                     }
-        //                     Logger.Debug($"Sprite overlayed for character: {this.text[c.index]}");
-        //                     img.material = BeatSaberUtils.UINoGlowMaterial;
-        //                     // img.rectTransform.localScale = new Vector3(this.fontScale * 1.08f, this.fontScale * 1.08f, this.fontScale * 1.08f);
-        //                     img.rectTransform.localScale = new Vector3(this.m_fontScaleMultiplier * 1.08f, this.m_fontScaleMultiplier * 1.08f, this.m_fontScaleMultiplier * 1.08f);
-        //                     img.rectTransform.sizeDelta = new Vector2(imageInfo.Width, imageInfo.Height);
-        //                     img.rectTransform.SetParent(this.rectTransform, false);
-        //                     img.rectTransform.localPosition = c.topLeft - new Vector3(0, imageInfo.Height * this.m_fontScaleMultiplier * 0.558f / 2);
-        //                     img.rectTransform.localRotation = Quaternion.identity;
-        //                     img.gameObject.SetActive(true);
-        //                     img.SetAllDirty();
-        //                     this._currentImages.Add(img);
-        //                     Logger.Debug($"Sprite overlayed for character: {this.text[c.index]}");
-        //                 }
-        //                 catch (Exception ex) {
-        //                     Logger.Error($"Exception while trying to overlay sprite. {ex.ToString()}");
-        //                     _imagePool.Free(img);
-        //                 }
-        //             });
-        //             Logger.Debug($"Image overlayed for character: {this.text[c.index]}");
-        //         }
-        //     }
-        //     Logger.Debug("Exiting EnhancedTextMeshProUGUI.Rebuild.");
-        //     base.Rebuild(update);
-        //     Logger.Debug("Base rebuild complete.");
-        //     if (update == CanvasUpdate.LatePreRender) {
-        //         MainThreadInvoker.Invoke(OnLatePreRenderRebuildComplete);
-        //     }
-        //     Logger.Debug("Exiting EnhancedTextMeshProUGUI.Rebuild. 2");
-        // }
-        //
         public override void Rebuild(CanvasUpdate update)
         {
-            // try
-            // {
-            // Logger.Debug($"Into EnhancedTextMeshProUGUI.Rebuild, update: {update}");
-
-            // 如果是处理图片的阶段
-            if (update == CanvasUpdate.LatePreRender)
-            {
-                MainThreadInvoker.Invoke(() =>
-                {
-                    // Logger.Debug("Clearing images...");
-                    this.ClearImages();
-                    // Logger.Debug("Images cleared.");
-
-
-                    // Logger.Debug("Rebuilding images...");
-                    // try
-                    // {
-                    //     var fieldInfo = typeof(TextMeshProUGUI).GetField("m_TextProcessingArray",
-                    //         BindingFlags.NonPublic | BindingFlags.Instance);
-                    //     var mTextProcessingArray = fieldInfo.GetValue(this);
-                    //     // Logger.Debug($"m_TextProcessingArray is null: {mTextProcessingArray == null}");
-                    //     if (mTextProcessingArray != null)
-                    //     {
-                    //         // Logger.Debug($"m_TextProcessingArray length: {((Array)mTextProcessingArray).Length}");
-                    //         // for (var i = 0; i < ((Array)mTextProcessingArray).Length; i++)
-                    //         // {
-                    //         //     Logger.Debug($"m_TextProcessingArray[{i}]: {((Array)mTextProcessingArray).GetValue(i)}");
-                    //         // }
-                    //     }
-                    //     // Logger.Debug($"m_havePropertiesChanged: {this.havePropertiesChanged}");
-                    //     // Logger.Debug($"m_text: {this.m_text}");
-                    //     // this.havePropertiesChanged = true;
-                    //
-                    //     // this.ForceMeshUpdate();
-                    // }
-                    // catch (Exception ex)
-                    // {
-                    //     Logger.Error($"Exception while trying to force mesh update. {ex}");
-                    // }
-
-                    // Logger.Debug(
-                    //     $"textInfo is null: {this.textInfo == null}, characterCount: {this.textInfo.characterCount}, text: {this.text}");
-                    for (var i = 0; i < this.textInfo.characterCount; i++)
+            switch (update) {
+                case CanvasUpdate.LatePreRender:
+                    _ = MainThreadInvoker.Invoke(() =>
                     {
-                        var c = this.textInfo.characterInfo[i];
-
-                        // Logger.Debug(
-                        //     $"Processing character at index {i}: CharCode={c.character}, Visible={c.isVisible}, Text={this.text}");
-
-                        if (!c.isVisible || string.IsNullOrEmpty(this.text) || c.index >= this.text.Length)
-                        {
-                            // 跳过不可见字符、空字符或索引越界的字符
-                            // Logger.Debug(
-                            //     $"Skipping character at index {i}: CharCode={c.character}, Visible={c.isVisible}, Text={this.text}");
-                            continue;
+                        #if BADGE_DEBUG
+                        if (ShouldLogTask14Debug()) {
+                            var textSnapshot = this.text ?? string.Empty;
+                            if (textSnapshot.Length > 80) {
+                                textSnapshot = textSnapshot.Substring(0, 80) + "...";
+                            }
+                            textSnapshot = textSnapshot.Replace("\r", "\\r").Replace("\n", "\\n");
+                            var linkCount = this.textInfo?.linkCount ?? -1;
+                            Logger.Info("[TASK14DBG][ESC-REBUILD] " + $"Rebuild LatePreRender start textPrefix={textSnapshot} linkCount={linkCount}");
                         }
+                        #endif
 
-                        uint character = this.text[c.index];
-                        if (c.index + 1 < this.text.Length &&
-                            char.IsSurrogatePair(this.text[c.index], this.text[c.index + 1]))
-                        {
-                            // 处理代理对字符
-                            // Logger.Debug($"Character at index {i} is a surrogate pair.");
-                            character = (uint)char.ConvertToUtf32(this.text[c.index], this.text[c.index + 1]);
-                            // Logger.Debug($"Converted surrogate pair to: {character}");
-                        }
+                        this.ClearImages();
+#if DEBUG
+                        var rebuildStartTicks = Stopwatch.GetTimestamp();
+#endif
+                        using (BadgeRebuildProfilerMarker.Auto()) {
+                            for (var i = 0; i < this.textInfo.characterCount; i++) {
+                            var c = this.textInfo.characterInfo[i];
+                            if (!c.isVisible || string.IsNullOrEmpty(this.text) || c.index >= this.text.Length) {
+                                // Skip invisible/empty/out of range chars
+                                continue;
+                            }
 
-                        // Logger.Debug($"Processing character: {character}");
+                            uint character = this.text[c.index];
+                            if (c.index + 1 < this.text.Length && char.IsSurrogatePair(this.text[c.index], this.text[c.index + 1])) {
+                                // If it's a surrogate pair, convert the character
+                                character = (uint)char.ConvertToUtf32(this.text[c.index], this.text[c.index + 1]);
+                            }
+                            if (this.FontInfo == null || !this.FontInfo.TryGetImageInfo(character, out var imageInfo) || imageInfo is null) {
+                                //Logger.Debug($"{c.character}:{character}, Skip characters that have no imageInfo registered");
+                                continue;
+                            }
+                            var img = this._imagePool?.Spawn();
+                            if (img == null) {
+                                continue;
+                            }
+                            try {
+                                var fontScale = 0.010f * this.fontSize;
+                                var isAvatar = this.IsBilibiliAvatar(imageInfo);
+                                var isBroadcaster = IsBroadcasterPrefixImage(imageInfo);
+                                var isMetadata = this.IsBilibiliMetadataImage(imageInfo);
+                                var layoutMetrics = GetImageLayoutMetrics(imageInfo, isAvatar, isMetadata, isBroadcaster);
+                                var scaledFontFactor = fontScale * layoutMetrics.ScaleMultiplier;
+                                var imageLocalPosition = GetImageLocalPosition(c, imageInfo, fontScale, layoutMetrics);
 
-                        if (this.FontInfo == null || !this.FontInfo.TryGetImageInfo(character, out var imageInfo) ||
-                            imageInfo == null)
-                        {
-                            // Logger.Warn($"No imageInfo found for character: {character:X}");
-                            continue;
-                        }
+                                if (isAvatar) {
+                                    var wrapper = this.RentAvatarMaskWrapper();
+                                    this._avatarMaskWrappersByImage[img] = wrapper;
 
-                        // Logger.Debug($"Found imageInfo for character: {character}");
+                                    wrapper.SetParent(this.rectTransform, false);
+                                    wrapper.localScale = new Vector3(scaledFontFactor, scaledFontFactor, scaledFontFactor);
+                                    wrapper.sizeDelta = new Vector2(imageInfo.Width, imageInfo.Height);
+                                    wrapper.localPosition = imageLocalPosition;
+                                    wrapper.localRotation = Quaternion.identity;
 
-                        MainThreadInvoker.Invoke(() =>
-                        {
-                            var img = _imagePool.Alloc();
-                            try
-                            {
-                                // Logger.Debug($"Overlaying sprite for character: {character}");
-                                if (imageInfo.AnimControllerData != null)
-                                {
-                                    img.animStateUpdater.ControllerData = imageInfo.AnimControllerData;
-                                    img.sprite =
-                                        imageInfo.AnimControllerData.Sprites[imageInfo.AnimControllerData.UvIndex];
+                                    img.rectTransform.SetParent(wrapper, false);
+                                    img.rectTransform.localScale = Vector3.one;
+                                    img.rectTransform.sizeDelta = new Vector2(imageInfo.Width, imageInfo.Height);
+                                    img.rectTransform.localPosition = Vector3.zero;
+                                    img.rectTransform.localRotation = Quaternion.identity;
                                 }
-                                else
-                                {
+                                else {
+                                    img.rectTransform.SetParent(this.rectTransform, false);
+                                    img.rectTransform.localScale = new Vector3(scaledFontFactor, scaledFontFactor, scaledFontFactor);
+                                    img.rectTransform.sizeDelta = new Vector2(imageInfo.Width, imageInfo.Height);
+                                    img.rectTransform.localPosition = imageLocalPosition;
+                                    img.rectTransform.localRotation = Quaternion.identity;
+                                }
+
+                                if (imageInfo.AnimControllerData != null) {
+                                    img.AnimStateUpdater.ControllerData = imageInfo.AnimControllerData;
+                                    img.sprite = imageInfo.AnimControllerData.Sprites[imageInfo.AnimControllerData.UvIndex];
+                                }
+                                else {
                                     img.sprite = imageInfo.Sprite;
                                 }
-
+                                // Keep avatar and metadata overlays on no-glow UI material to avoid halo artifacts.
                                 img.material = BeatSaberUtils.UINoGlowMaterial;
-                                img.rectTransform.localScale = new Vector3(this.m_fontScaleMultiplier * 1.08f,
-                                    this.m_fontScaleMultiplier * 1.08f, this.m_fontScaleMultiplier * 1.08f);
-                                img.rectTransform.sizeDelta = new Vector2(imageInfo.Width, imageInfo.Height);
-                                img.rectTransform.SetParent(this.rectTransform, false);
-                                img.rectTransform.localPosition = c.topLeft - new Vector3(0,
-                                    imageInfo.Height * this.m_fontScaleMultiplier * 0.558f / 2);
-                                img.rectTransform.localRotation = Quaternion.identity;
-                                img.gameObject.SetActive(true);
                                 img.SetAllDirty();
-                                this._currentImages.Add(img);
-                                // Logger.Debug($"Sprite overlayed for character: {character}");
                             }
-                            catch (Exception ex)
-                            {
-                                // Logger.Error($"Exception while trying to overlay sprite. {ex}");
-                                _imagePool.Free(img);
+                            catch (Exception ex) {
+                                Logger.Error($"Exception while trying to overlay sprite. {ex}");
+                                this.DespawnImage(img);
                             }
-                        });
-                    }
-                });
+                        }
+                        }
+#if DEBUG
+                        var rebuildElapsedMicroseconds = ((Stopwatch.GetTimestamp() - rebuildStartTicks) * 1000000L) / Stopwatch.Frequency;
+                        s_badgePerfAggregator.RecordRebuildSample(rebuildElapsedMicroseconds);
+#endif
+                        this._rebuiled = true;
+                    });
+                    break;
+                case CanvasUpdate.Prelayout:
+                case CanvasUpdate.Layout:
+                case CanvasUpdate.PostLayout:
+                case CanvasUpdate.PreRender:
+                case CanvasUpdate.MaxUpdateValue:
+                default:
+                    break;
             }
-
-            // 在此处添加日志，检查传递给 SetArraySizes 的 unicodeChars 数组
-            // Logger.Debug("Before calling SetArraySizes.");
-            // Logger.Debug(
-            //     $"textInfo is null: {this.textInfo == null}, characterCount: {this.textInfo.characterCount}, text: {this.text}");
-            // if (this.textInfo != null && this.textInfo.characterCount > 0)
-            // {
-            //     for (var i = 0; i < this.textInfo.characterCount; i++)
-            //     {
-            //         Logger.Debug($"UnicodeChar[{i}]: {this.textInfo.characterInfo[i].character}");
-            //     }
-            // }
-
             base.Rebuild(update);
-            // Logger.Debug("Base rebuild complete.");
+        }
 
-            if (update == CanvasUpdate.LatePreRender)
-            {
-                // Logger.Debug("Calling OnLatePreRenderRebuildComplete.");
-                MainThreadInvoker.Invoke(OnLatePreRenderRebuildComplete);
-                // Logger.Debug("OnLatePreRenderRebuildComplete called.");
+        public void AddReciver(ILatePreRenderRebuildReciver reciver)
+        {
+            this.LazyCopyHashSet.Add(reciver);
+        }
+
+        public void RemoveReciver(ILatePreRenderRebuildReciver reciver)
+        {
+            this.LazyCopyHashSet.Remove(reciver);
+        }
+
+        protected void LateUpdate()
+        {
+            if (this._rebuiled) {
+                foreach (var reciver in this._recivers.items) {
+                    reciver?.LatePreRenderRebuildHandler(this, EventArgs.Empty);
+                }
+                this._rebuiled = false;
             }
 
-            // Logger.Debug("Exiting EnhancedTextMeshProUGUI.Rebuild. 2");
-            // }
-            // catch (Exception ex)
-            // {
-            //     Logger.Error($"Exception in EnhancedTextMeshProUGUI.Rebuild: {ex}");
-            // }
+#if DEBUG
+            s_badgePerfAggregator.RecordFrameSample(Time.frameCount, Time.unscaledDeltaTime);
+#endif
+        }
+
+#if DEBUG
+        private sealed class BadgePerfAggregator
+        {
+            private static readonly long FlushIntervalTicks = Stopwatch.Frequency * 60;
+            private static readonly long[] FrameHistogramUpperBoundsUs = { 16667, 20000, 25000, 33333, 50000, 100000, 250000, 500000, 1000000, 2000000, long.MaxValue };
+            private static readonly long[] RebuildHistogramUpperBoundsUs = { 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, long.MaxValue };
+
+            private readonly long[] _frameHistogram = new long[FrameHistogramUpperBoundsUs.Length];
+            private readonly long[] _rebuildHistogram = new long[RebuildHistogramUpperBoundsUs.Length];
+
+            private int _lastFrameCount = -1;
+            private long _nextFlushTicks = Stopwatch.GetTimestamp() + FlushIntervalTicks;
+
+            private long _frameSampleCount;
+            private long _frameTotalUs;
+            private long _frameMaxUs;
+            private long _frameSpikeCount;
+
+            private long _rebuildSampleCount;
+            private long _rebuildTotalUs;
+            private long _rebuildMaxUs;
+
+            private bool _hasGcBaseline;
+            private long _lastGcTotalMemory;
+            private int _lastGen0CollectionCount;
+            private int _lastGen1CollectionCount;
+            private int _lastGen2CollectionCount;
+
+            public void RecordFrameSample(int frameCount, float frameDeltaTime)
+            {
+                if (frameCount == this._lastFrameCount) {
+                    return;
+                }
+
+                this._lastFrameCount = frameCount;
+                var frameUs = (long)Math.Max(0f, frameDeltaTime * 1000000f);
+                this._frameSampleCount++;
+                this._frameTotalUs += frameUs;
+                if (frameUs > this._frameMaxUs) {
+                    this._frameMaxUs = frameUs;
+                }
+                if (frameUs > 16667) {
+                    this._frameSpikeCount++;
+                }
+
+                this._frameHistogram[GetHistogramBucket(FrameHistogramUpperBoundsUs, frameUs)]++;
+                this.TryFlushIfNeeded();
+            }
+
+            public void RecordRebuildSample(long rebuildUs)
+            {
+                var clampedUs = Math.Max(0L, rebuildUs);
+                this._rebuildSampleCount++;
+                this._rebuildTotalUs += clampedUs;
+                if (clampedUs > this._rebuildMaxUs) {
+                    this._rebuildMaxUs = clampedUs;
+                }
+
+                this._rebuildHistogram[GetHistogramBucket(RebuildHistogramUpperBoundsUs, clampedUs)]++;
+                this.TryFlushIfNeeded();
+            }
+
+            private void TryFlushIfNeeded()
+            {
+                var now = Stopwatch.GetTimestamp();
+                if (now < this._nextFlushTicks) {
+                    return;
+                }
+
+                this._nextFlushTicks = now + FlushIntervalTicks;
+
+                var totalMemory = GC.GetTotalMemory(false);
+                var gen0CollectionCount = GC.CollectionCount(0);
+                var gen1CollectionCount = GC.CollectionCount(1);
+                var gen2CollectionCount = GC.CollectionCount(2);
+
+                long memoryDeltaBytes = 0;
+                var gen0Delta = 0;
+                var gen1Delta = 0;
+                var gen2Delta = 0;
+
+                if (this._hasGcBaseline) {
+                    memoryDeltaBytes = totalMemory - this._lastGcTotalMemory;
+                    gen0Delta = gen0CollectionCount - this._lastGen0CollectionCount;
+                    gen1Delta = gen1CollectionCount - this._lastGen1CollectionCount;
+                    gen2Delta = gen2CollectionCount - this._lastGen2CollectionCount;
+                }
+                else {
+                    this._hasGcBaseline = true;
+                }
+
+                this._lastGcTotalMemory = totalMemory;
+                this._lastGen0CollectionCount = gen0CollectionCount;
+                this._lastGen1CollectionCount = gen1CollectionCount;
+                this._lastGen2CollectionCount = gen2CollectionCount;
+
+                var frameAvgMs = this._frameSampleCount > 0 ? (this._frameTotalUs / (double)this._frameSampleCount) / 1000d : 0d;
+                var frameP95Ms = GetP95FromHistogram(this._frameHistogram, FrameHistogramUpperBoundsUs, this._frameSampleCount) / 1000d;
+                var frameMaxMs = this._frameMaxUs / 1000d;
+
+                var rebuildAvgUs = this._rebuildSampleCount > 0 ? this._rebuildTotalUs / (double)this._rebuildSampleCount : 0d;
+                var rebuildP95Us = GetP95FromHistogram(this._rebuildHistogram, RebuildHistogramUpperBoundsUs, this._rebuildSampleCount);
+
+                Logger.Info(
+                    $"[BadgePerfAgg/60s] frameSamples={this._frameSampleCount} frameAvgMs={frameAvgMs:F2} frameP95Ms={frameP95Ms:F2} frameMaxMs={frameMaxMs:F2} " +
+                    $"frameSpikeCount={this._frameSpikeCount} rebuildSamples={this._rebuildSampleCount} rebuildAvgUs={rebuildAvgUs:F2} rebuildP95Us={rebuildP95Us} " +
+                    $"rebuildMaxUs={this._rebuildMaxUs} gcDeltaKB={memoryDeltaBytes / 1024L} gen0Delta={gen0Delta} gen1Delta={gen1Delta} gen2Delta={gen2Delta}");
+
+                this._frameSampleCount = 0;
+                this._frameTotalUs = 0;
+                this._frameMaxUs = 0;
+                this._frameSpikeCount = 0;
+                this._rebuildSampleCount = 0;
+                this._rebuildTotalUs = 0;
+                this._rebuildMaxUs = 0;
+                Array.Clear(this._frameHistogram, 0, this._frameHistogram.Length);
+                Array.Clear(this._rebuildHistogram, 0, this._rebuildHistogram.Length);
+            }
+
+            private static int GetHistogramBucket(long[] bounds, long value)
+            {
+                for (var i = 0; i < bounds.Length; i++) {
+                    if (value <= bounds[i]) {
+                        return i;
+                    }
+                }
+
+                return bounds.Length - 1;
+            }
+
+            private static long GetP95FromHistogram(long[] histogram, long[] bounds, long totalCount)
+            {
+                if (totalCount <= 0) {
+                    return 0;
+                }
+
+                var threshold = (long)Math.Ceiling(totalCount * 0.95d);
+                long cumulative = 0;
+                for (var i = 0; i < histogram.Length; i++) {
+                    cumulative += histogram[i];
+                    if (cumulative >= threshold) {
+                        return bounds[i];
+                    }
+                }
+
+                return bounds[bounds.Length - 1];
+            }
+        }
+#endif
+
+#if BADGE_DEBUG
+        private static bool ShouldLogTask14Debug()
+        {
+            var now = Stopwatch.GetTimestamp();
+            if (now < s_nextTask14DebugLogTicks) {
+                return false;
+            }
+
+            s_nextTask14DebugLogTicks = now + (Stopwatch.Frequency * 60);
+            return true;
+        }
+#endif
+
+        public class Factory : PlaceholderFactory<EnhancedTextMeshProUGUI>
+        {
+        }
+
+        private readonly struct ImageLayoutMetrics
+        {
+            public float ScaleMultiplier { get; }
+            public float VerticalOffsetFactor { get; }
+            public bool UseBaselinePosition { get; }
+
+            public ImageLayoutMetrics(float scaleMultiplier, float verticalOffsetFactor, bool useBaselinePosition)
+            {
+                ScaleMultiplier = scaleMultiplier;
+                VerticalOffsetFactor = verticalOffsetFactor;
+                UseBaselinePosition = useBaselinePosition;
+            }
         }
     }
 }

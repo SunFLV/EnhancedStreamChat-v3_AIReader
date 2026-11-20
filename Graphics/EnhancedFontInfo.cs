@@ -1,4 +1,5 @@
-﻿using System.Collections.Concurrent;
+using System;
+using System.Collections.Concurrent;
 using TMPro;
 using UnityEngine.TextCore;
 
@@ -7,10 +8,10 @@ namespace EnhancedStreamChat.Graphics
     public class EnhancedFontInfo
     {
         public TMP_FontAsset Font { get; }
-        public uint NextReplaceChar { get; private set; } = 0xe000;
+        public uint NextReplaceChar { get; private set; } = UNICODE_USER_FIRST_AREA_MINIMUM_VALUE;
         public ConcurrentDictionary<string, uint> CharacterLookupTable { get; } = new ConcurrentDictionary<string, uint>();
         public ConcurrentDictionary<uint, EnhancedImageInfo> ImageInfoLookupTable { get; } = new ConcurrentDictionary<uint, EnhancedImageInfo>();
-        private readonly object _lock = new object();
+        private static readonly object s_lock = new object();
 
         private const uint UNICODE_USER_FIRST_AREA_MINIMUM_VALUE = 0x0000E000;
         private const uint UNICODE_USER_FIRST_AREA_MAXIMUM_VALUE = 0x0000F8FF;
@@ -20,6 +21,19 @@ namespace EnhancedStreamChat.Graphics
 
         private const uint UNICODE_USER_THARD_AREA_MINIMUM_VALUE = 0x00100000;
         private const uint UNICODE_USER_THARD_AREA_MAXIMUM_VALUE = 0x0010FFFD;
+        private const float ImageGlyphAdvanceScale = 0.7f;
+#if BS_1423
+        private const float AvatarGlyphAdvanceScale = 1.18f;
+        private const float MetadataGlyphAdvanceScale = 0.90f;
+        private const float BroadcasterGlyphAdvanceScale = 0.94f;
+        private const float BilibiliBadgeBaseAspectRatio = 1.6f;
+        private const float BilibiliBadgeAdvancePerAspectRatio = 0.22f;
+        private const float BilibiliBadgeAdvanceMaxBonus = 0.24f;
+#else
+        private const float AvatarGlyphAdvanceScale = 0.9f;
+        private const float MetadataGlyphAdvanceScale = 0.82f;
+        private const float BroadcasterGlyphAdvanceScale = 0.86f;
+#endif
 
         public EnhancedFontInfo(TMP_FontAsset font)
         {
@@ -49,48 +63,97 @@ namespace EnhancedStreamChat.Graphics
             return ret;
         }
 
-        public bool TryGetCharacter(string id, out uint character) => this.CharacterLookupTable.TryGetValue(id, out character);
+        public bool TryGetCharacter(string id, out uint character)
+        {
+            return this.CharacterLookupTable.TryGetValue(id, out character);
+        }
 
-        public bool TryGetImageInfo(uint character, out EnhancedImageInfo imageInfo) => this.ImageInfoLookupTable.TryGetValue(character, out imageInfo);
+        public bool TryGetImageInfo(uint character, out EnhancedImageInfo imageInfo)
+        {
+            return this.ImageInfoLookupTable.TryGetValue(character, out imageInfo);
+        }
 
         public bool TryRegisterImageInfo(EnhancedImageInfo imageInfo, out uint replaceCharacter)
         {
-            Logger.Info($"Registering image info for {imageInfo.ImageId}, sprite: {imageInfo.Sprite}, width: {imageInfo.Width}, height: {imageInfo.Height}");
-            if (!this.CharacterLookupTable.ContainsKey(imageInfo.ImageId)) {
-                Logger.Debug("Character not found, registering...");
-                uint next;
-                do {
-                    next = this.GetNextReplaceChar();
-                    Logger.Debug($"Trying character {next:X}");
+            lock (s_lock) {
+                if (!this.CharacterLookupTable.ContainsKey(imageInfo.ImageId)) {
+                    uint next;
+                    do {
+                        next = this.GetNextReplaceChar();
+                    }
+                    while (this.Font.characterLookupTable.ContainsKey(next));
+#if DEBUG
+                    Logger.Debug($"Unicode : 0x{next:X8}");
+#endif
+                    this.Font.characterLookupTable.Add(next, new TMP_Character(next, this.Font, new Glyph(next, new GlyphMetrics(0, 0, 0, 0, imageInfo.Width * GetImageGlyphAdvanceScale(imageInfo)), new GlyphRect(0, 0, 0, 0))));
+                    _ = this.CharacterLookupTable.TryAdd(imageInfo.ImageId, next);
+                    _ = this.ImageInfoLookupTable.TryAdd(next, imageInfo);
+                    replaceCharacter = next;
+                    return true;
                 }
-                while (this.Font.characterLookupTable.ContainsKey(next));
-                Logger.Debug($"Character {next:X} is available, registering...");
-                this.Font.characterLookupTable.Add(next, new TMP_Character(next, new Glyph(next, new GlyphMetrics(0, 0, 0, 0, imageInfo.Width), new GlyphRect(0, 0, 0, 0))));
-                this.CharacterLookupTable.TryAdd(imageInfo.ImageId, next);
-                this.ImageInfoLookupTable.TryAdd(next, imageInfo);
-                Logger.Debug($"Registered image info for {imageInfo.ImageId} at character {next:X}, font name: {this.Font.name}");
-                replaceCharacter = next;
-                Logger.Debug($"Returning character {replaceCharacter:X}");
-                return true;
+                replaceCharacter = 0;
+                return false;
             }
-            replaceCharacter = 0;
-            Logger.Warn($"Character {imageInfo.ImageId} is already registered!");
-            return false;
         }
 
         public bool TryUnregisterImageInfo(string id, out uint unregisteredCharacter)
         {
-            lock (this._lock) {
+            lock (s_lock) {
                 if (!this.CharacterLookupTable.TryGetValue(id, out var c)) {
                     unregisteredCharacter = 0;
                     return false;
                 }
                 if (this.Font.characterLookupTable.ContainsKey(c)) {
-                    this.Font.characterLookupTable.Remove(c);
+                    _ = this.Font.characterLookupTable.Remove(c);
                 }
-                this.CharacterLookupTable.TryRemove(id, out unregisteredCharacter);
+                _ = this.CharacterLookupTable.TryRemove(id, out unregisteredCharacter);
                 return this.ImageInfoLookupTable.TryRemove(unregisteredCharacter, out var unregisteredImageInfo);
             }
         }
+
+        private static float GetImageGlyphAdvanceScale(EnhancedImageInfo imageInfo)
+        {
+            var imageId = imageInfo?.ImageId;
+            if (string.IsNullOrEmpty(imageId)) {
+                return ImageGlyphAdvanceScale;
+            }
+
+            if (imageId.StartsWith("Bili_avatar_", StringComparison.OrdinalIgnoreCase)) {
+                return AvatarGlyphAdvanceScale;
+            }
+
+            if (imageId.IndexOf("_broadcaster_", StringComparison.OrdinalIgnoreCase) >= 0) {
+                return BroadcasterGlyphAdvanceScale;
+            }
+
+#if BS_1423
+            if (imageId.StartsWith("Bili_badge_", StringComparison.OrdinalIgnoreCase)) {
+                return GetBilibiliBadgeAdvanceScale(imageInfo);
+            }
+#endif
+
+            if (imageId.StartsWith("Bili_", StringComparison.OrdinalIgnoreCase)) {
+                return MetadataGlyphAdvanceScale;
+            }
+
+            return ImageGlyphAdvanceScale;
+        }
+
+#if BS_1423
+        private static float GetBilibiliBadgeAdvanceScale(EnhancedImageInfo imageInfo)
+        {
+            if (imageInfo == null || imageInfo.Height <= 0 || imageInfo.Width <= 0) {
+                return MetadataGlyphAdvanceScale;
+            }
+
+            var aspectRatio = (float)imageInfo.Width / imageInfo.Height;
+            var aspectBonus = Math.Max(0f, aspectRatio - BilibiliBadgeBaseAspectRatio) * BilibiliBadgeAdvancePerAspectRatio;
+            if (aspectBonus > BilibiliBadgeAdvanceMaxBonus) {
+                aspectBonus = BilibiliBadgeAdvanceMaxBonus;
+            }
+
+            return MetadataGlyphAdvanceScale + aspectBonus;
+        }
+#endif
     }
 }

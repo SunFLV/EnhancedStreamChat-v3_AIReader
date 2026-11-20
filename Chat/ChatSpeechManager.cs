@@ -1,5 +1,4 @@
-using ChatCore.Interfaces;
-using EnhancedStreamChat.Utilities;
+using EnhancedStreamChat.Interfaces;
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
@@ -14,22 +13,34 @@ namespace EnhancedStreamChat.Chat
 {
     /// <summary>
     /// AI-powered TTS (Text-to-Speech) manager for danmaku reading.
-    /// Sends chat messages to a remote GPT-SoVITS TTS server and plays the synthesized audio.
+    /// Sends chat messages to the GPT-SoVITS proxy backend and plays the synthesized audio.
+    ///
+    /// 后端接口（AI TTS Proxy v3）：
+    ///   POST /api/tts      body: { speaker, text, voice, version, speed }  -> audio/wav
+    ///   GET  /api/voices   -> { voices, versions, default_voice, default_version, ... }
+    ///   GET  /api/servers  -> { servers, current }
+    /// 通过 ?_srv=&lt;下标&gt; 指定由哪台后端合成（单句取勾选的第一台）。
     /// </summary>
-    public class ChatSpeechManager : PersistentSingleton<ChatSpeechManager>
+    public class ChatSpeechManager : MonoBehaviour
     {
+        public static ChatSpeechManager Instance { get; private set; }
+
         // ── Queue Management ──────────────────────────────────────
-        private readonly ConcurrentQueue<IChatMessage> _speechQueue = new ConcurrentQueue<IChatMessage>();
+        private readonly ConcurrentQueue<IESCChatMessage> _speechQueue = new ConcurrentQueue<IESCChatMessage>();
         private bool _isProcessing;
         private Coroutine _processCoroutine;
         private bool _testSpeechActive;
 
+        /// <summary>弹幕事件可能来自后台线程；协程只能在主线程启动，这里做一次转交。</summary>
+        private volatile bool _pendingStart;
+
         // ── Audio Playback ────────────────────────────────────────
         private AudioSource _audioSource;
         private GameObject _audioGameObject;
+        private AudioGainFilter _gainFilter;
 
         // ── HTTP ──────────────────────────────────────────────────
-        private string _tempAudioPath;
+        private int _serverCount;
 
         // ── Regex for stripping rich text tags ────────────────────
         private static readonly Regex RichTextRegex = new Regex(
@@ -37,19 +48,14 @@ namespace EnhancedStreamChat.Chat
             RegexOptions.Compiled | RegexOptions.CultureInvariant
         );
 
-        // ── JSON helpers for voice list deserialization ─────────────
-        [Serializable]
-        private class VoiceListResponse
-        {
-            public VoiceEntry[] voices;
-        }
-
+        // ── JSON DTOs ─────────────────────────────────────────────
         [Serializable]
         private class TTSRequestBody
         {
             public string speaker;  // sender name (empty for system/test)
             public string text;     // message content
             public string voice;
+            public string version;  // empty = server default
             public float speed;
         }
 
@@ -60,166 +66,175 @@ namespace EnhancedStreamChat.Chat
             public string description;
         }
 
+        [Serializable]
+        private class VersionEntry
+        {
+            public string name;
+            public string label;
+            public int sample_steps;
+        }
+
+        [Serializable]
+        private class VoiceListResponse
+        {
+            public VoiceEntry[] voices;
+            public VersionEntry[] versions;
+            public string default_voice;
+            public string default_version;
+            public string server_name;
+        }
+
+        [Serializable]
+        private class ServerEntry
+        {
+            public string name;
+            public string url;
+            public string desc;
+            public string kind;
+            public string detail;
+            public bool engine;
+        }
+
+        [Serializable]
+        private class ServerListResponse
+        {
+            public ServerEntry[] servers;
+            public string current;
+        }
+
         // ── Unity Lifecycle ───────────────────────────────────────
 
         private void Awake()
         {
-            Logger.Info("[TTS] ChatSpeechManager Awake - initializing audio system");
-            // Create a dedicated persistent GameObject for audio playback
-            _audioGameObject = new GameObject("ChatSpeechAudio");
-            DontDestroyOnLoad(_audioGameObject);
-            _audioGameObject.transform.SetParent(this.transform);
+            if (Instance != null && Instance != this)
+            {
+                Destroy(this.gameObject);
+                return;
+            }
+            Instance = this;
+            DontDestroyOnLoad(this.gameObject);
 
-            _audioSource = _audioGameObject.AddComponent<AudioSource>();
+            Logger.Info("[TTS] ChatSpeechManager Awake - initializing audio system");
+            _audioGameObject = this.gameObject;
+
+            _audioSource = _audioGameObject.GetComponent<AudioSource>() ?? _audioGameObject.AddComponent<AudioSource>();
             _audioSource.playOnAwake = false;
             _audioSource.loop = false;
-            _audioSource.spatialBlend = 0f; // 2D audio (not spatialized)
+            _audioSource.spatialBlend = 0f; // 2D audio
+            _audioSource.volume = 1f;       // 实际音量由 AudioGainFilter 处理（支持 >100%）
 
-            _tempAudioPath = Path.Combine(Application.temporaryCachePath, "tts_speech.wav");
+            _gainFilter = _audioGameObject.GetComponent<AudioGainFilter>() ?? _audioGameObject.AddComponent<AudioGainFilter>();
+            _gainFilter.Gain = ChatSpeechConfig.Instance.SpeechVolume;
 
-            // Fetch available voices later (after scene is fully loaded, to avoid SSL timing issues)
             StartCoroutine(DelayedStartup());
         }
 
-        protected override void OnDestroy()
+        private void OnDestroy()
         {
             StopAllCoroutines();
             if (_audioSource != null)
             {
                 _audioSource.Stop();
             }
-            if (_audioGameObject != null)
+
+            if (Instance == this)
             {
-                Destroy(_audioGameObject);
+                Instance = null;
+            }
+        }
+
+        private void Update()
+        {
+            if (_audioSource != null && _gainFilter != null)
+            {
+                _gainFilter.Gain = ChatSpeechConfig.Instance.SpeechVolume;
             }
 
-            // Clean temp file
-            try
+            // 后台线程只负责入队，协程在主线程启动
+            if (_pendingStart && !_isProcessing && _processCoroutine == null)
             {
-                if (File.Exists(_tempAudioPath))
+                _pendingStart = false;
+                if (!_speechQueue.IsEmpty)
                 {
-                    File.Delete(_tempAudioPath);
+                    _processCoroutine = StartCoroutine(ProcessQueueCoroutine());
                 }
             }
-            catch { /* ignore cleanup errors */ }
-
-            base.OnDestroy();
         }
 
         // ── Public API ────────────────────────────────────────────
 
-        /// <summary>
-        /// Enqueue a chat message for TTS reading.
-        /// Called from ChatDisplay.OnTextMessageReceived.
-        /// </summary>
-        public void EnqueueMessage(IChatMessage msg)
+        /// <summary>Enqueue a chat message for TTS reading.</summary>
+        public void EnqueueMessage(IESCChatMessage msg)
         {
             if (msg == null) return;
-            if (!ChatSpeechConfig.instance.SpeechEnabled) return;
-
-            // Apply filter
+            if (!ChatSpeechConfig.Instance.SpeechEnabled) return;
             if (!ShouldSpeak(msg)) return;
 
-            // Enforce max queue size — drop oldest messages when full
-            while (_speechQueue.Count >= ChatSpeechConfig.instance.SpeechMaxQueueSize)
+            while (_speechQueue.Count >= Mathf.Max(1, ChatSpeechConfig.Instance.SpeechMaxQueueSize))
             {
                 _speechQueue.TryDequeue(out _);
             }
 
             _speechQueue.Enqueue(msg);
-            Logger.Debug($"TTS: Enqueued message. Queue size: {_speechQueue.Count}");
-
-            // Start processing if idle
-            if (!_isProcessing && _processCoroutine == null)
-            {
-                _processCoroutine = StartCoroutine(ProcessQueueCoroutine());
-            }
+            _pendingStart = true;
+            Logger.Debug($"[TTS] Enqueued message. Queue size: {_speechQueue.Count}");
         }
 
-        /// <summary>
-        /// Skip the currently playing speech and process the next queued message.
-        /// </summary>
         public void Skip()
         {
             if (_audioSource != null && _audioSource.isPlaying)
             {
                 _audioSource.Stop();
-                Logger.Debug("TTS: Skipped current speech");
             }
         }
 
-        /// <summary>
-        /// Clear all pending speech messages from the queue.
-        /// </summary>
         public void ClearQueue()
         {
             while (_speechQueue.TryDequeue(out _)) { }
-            Logger.Debug("TTS: Queue cleared");
         }
 
-        /// <summary>
-        /// Send a test message to verify TTS is working.
-        /// Returns true if the message was enqueued.
-        /// </summary>
-        /// <summary>
-        /// Re-fetch voice list from the server. Call when settings panel opens.
-        /// </summary>
+        /// <summary>重新拉取后端服务器 / 音色 / 模型版本列表。</summary>
         public void RefreshVoices()
         {
-            Logger.Info("[TTS] RefreshVoices() called — fetching voices...");
-            StartCoroutine(FetchVoicesCoroutine());
+            Logger.Info("[TTS] RefreshVoices() called — fetching servers/voices...");
+            StartCoroutine(RefreshAllCoroutine());
         }
 
         public void TestSpeech(string text = "欢迎来到直播间")
         {
             if (string.IsNullOrWhiteSpace(text)) return;
+            if (_testSpeechActive) return;
 
-            Logger.Info($"[TTS] Test speech button clicked: \"{text}\"");
-            Logger.Info($"[TTS] Config - Enabled: {ChatSpeechConfig.instance.SpeechEnabled}");
-            Logger.Info($"[TTS] Config - ServerUrl: {ChatSpeechConfig.instance.SpeechServerUrl}");
-            Logger.Info($"[TTS] Config - Voice: {ChatSpeechConfig.instance.SpeechVoice}");
-            Logger.Info($"[TTS] GameObject active: {gameObject.activeInHierarchy}, enabled: {isActiveAndEnabled}");
+            var clean = StripRichText(text);
+            if (string.IsNullOrWhiteSpace(clean)) return;
 
-            // Don't interrupt ongoing test speech
-            if (_testSpeechActive)
-            {
-                Logger.Info("[TTS] Test speech already in progress, ignoring");
-                return;
-            }
             _testSpeechActive = true;
-            StartCoroutine(TestSpeechCoroutine(text));
+            StartCoroutine(TestSpeechCoroutine(clean));
         }
 
         // ── Filter Logic ──────────────────────────────────────────
 
-        private bool ShouldSpeak(IChatMessage msg)
+        private static bool ShouldSpeak(IESCChatMessage msg)
         {
-            // Never speak system messages
             if (msg.IsSystemMessage) return false;
 
-            var mode = ChatSpeechConfig.instance.SpeechFilterMode;
-            switch (mode)
+            switch (ChatSpeechConfig.Instance.SpeechFilterMode)
             {
-                case 0: // All messages
+                case 0:
                     return true;
-
-                case 1: // Highlighted / Mentioned only
-                    return msg.IsHighlighted || msg.IsPing;
-
-                case 2: // Gifts / SuperChats only
+                case 1:
+                    return msg.IsHighlighted || msg.IsMentioned;
+                case 2:
                     return IsGiftOrSuperChatMessage(msg);
-
                 default:
                     return false;
             }
         }
 
-        private bool IsGiftOrSuperChatMessage(IChatMessage msg)
+        private static bool IsGiftOrSuperChatMessage(IESCChatMessage msg)
         {
-            // Check metadata for platform-specific gift/superchat keys
             if (msg.Metadata != null)
             {
-                // Bilibili gift types
                 if (msg.Metadata.TryGetValue("msg_type", out var msgType))
                 {
                     if (msgType == "send_gift" ||
@@ -231,31 +246,26 @@ namespace EnhancedStreamChat.Chat
                         return true;
                     }
                 }
-
-                // Twitch: highlighted messages (bits, channel points, etc.)
-                // msg.IsHighlighted already handled in case 1; here we check for
-                // specific Twitch gift metadata
                 if (msg.Metadata.TryGetValue("bits", out var bits))
                 {
                     return !string.IsNullOrEmpty(bits) && bits != "0";
                 }
+                if (msg.Metadata.TryGetValue("platform", out var platform) && platform == "bilibili")
+                {
+                    if (msg.IsHighlighted) return true;
+                }
             }
 
-            // Fallback: check message content for gift-related patterns
-            // (e.g. "sent a gift", "投喂", etc.)
             var message = msg.Message;
             if (!string.IsNullOrEmpty(message))
             {
-                if (message.Contains("投喂") ||
-                    message.Contains("赠送") ||
-                    message.Contains("SuperChat") ||
-                    message.Contains("醒目留言") ||
+                if (message.Contains("投喂") || message.Contains("赠送") ||
+                    message.Contains("SuperChat") || message.Contains("醒目留言") ||
                     message.Contains("gift"))
                 {
                     return true;
                 }
             }
-
             return false;
         }
 
@@ -264,147 +274,179 @@ namespace EnhancedStreamChat.Chat
         private IEnumerator ProcessQueueCoroutine()
         {
             _isProcessing = true;
-            Logger.Debug("TTS: Queue processing started");
-
             while (_speechQueue.TryDequeue(out var msg))
             {
-                // Wait if a test speech is in progress
                 while (_testSpeechActive)
                 {
                     yield return null;
                 }
+                if (!ChatSpeechConfig.Instance.SpeechEnabled) break;
 
-                // Stop if TTS was disabled mid-queue
-                if (!ChatSpeechConfig.instance.SpeechEnabled)
-                {
-                    Logger.Debug("TTS: Disabled — stopping queue processing");
-                    break;
-                }
-
-                // Extract speaker name and message text separately
-                var speaker = StripRichText(msg.Sender.DisplayName);
+                var speaker = StripRichText(msg.Sender?.DisplayName);
                 var cleanText = StripRichText(msg.Message);
-
-                // Skip empty or whitespace-only messages
                 if (string.IsNullOrWhiteSpace(cleanText))
                 {
-                    Logger.Debug($"TTS: Skipping empty/whitespace message");
                     continue;
                 }
-
-                // Truncate long messages to avoid overwhelming TTS
-                const int maxLength = 200;
-                if (cleanText.Length > maxLength)
+                if (cleanText.Length > 200)
                 {
-                    var originalLength = cleanText.Length;
-                    cleanText = cleanText.Substring(0, maxLength);
-                    Logger.Debug($"TTS: Truncated message from {originalLength} to {maxLength} chars");
+                    cleanText = cleanText.Substring(0, 200);
                 }
 
-                Logger.Debug($"TTS: Processing: \"{speaker}说{cleanText}\"");
-
-                // Request TTS from server and play audio
                 yield return StartCoroutine(RequestAndPlayTTS(speaker, cleanText));
 
-                // Small gap between consecutive speeches
-                yield return new WaitForSeconds(0.3f);
+                var volume = ChatSpeechConfig.Instance.SpeechVolume;
+                yield return new WaitForSeconds(volume > 1.5f ? 0.5f : 0.3f);
             }
 
             _isProcessing = false;
             _processCoroutine = null;
-            Logger.Debug("TTS: Queue processing finished");
         }
 
-        private IEnumerator TestSpeechCoroutine(string text)
+        private IEnumerator TestSpeechCoroutine(string cleanText)
         {
-            Logger.Info($"[TTS] Coroutine started, text: \"{text}\"");
-            var cleanText = StripRichText(text);
-            Logger.Info($"[TTS] Cleaned text: \"{cleanText}\"");
-            if (cleanText.Length > 200)
-            {
-                cleanText = cleanText.Substring(0, 200);
-            }
+            if (cleanText.Length > 200) cleanText = cleanText.Substring(0, 200);
             yield return StartCoroutine(RequestAndPlayTTS(null, cleanText));
             _testSpeechActive = false;
-            Logger.Debug("TTS: Test speech finished");
         }
 
-        // ── Voice List Fetching ──────────────────────────────────────
+        // ── Server / Voice List Fetching ──────────────────────────
 
-        /// <summary>
-        /// Fetches the list of available TTS voices from the server
-        /// and updates the settings dropdown.
-        /// </summary>
         private IEnumerator DelayedStartup()
         {
-            yield return new WaitForSeconds(8f); // Wait for scene to fully load
-            yield return StartCoroutine(FetchVoicesCoroutine());
+            yield return new WaitForSeconds(8f);
+            yield return StartCoroutine(RefreshAllCoroutine());
+        }
 
-            // Auto-test disabled — use the "测试朗读" button instead
+        private IEnumerator RefreshAllCoroutine()
+        {
+            yield return StartCoroutine(FetchServersCoroutine());
+            yield return StartCoroutine(FetchVoicesCoroutine());
+            ChatSpeechConfig.NotifyListsUpdated();
+        }
+
+        private IEnumerator FetchServersCoroutine()
+        {
+            var url = BuildUrl("/api/servers", false);
+            using (var wr = UnityWebRequest.Get(url))
+            {
+                wr.timeout = 10;
+                wr.certificateHandler = new BypassCertificate();
+                yield return wr.SendWebRequest();
+
+                if (wr.result != UnityWebRequest.Result.Success)
+                {
+                    Logger.Warn($"[TTS] Could not fetch server list ({wr.responseCode}): {wr.error}");
+                    _serverCount = 0;
+                    yield break;
+                }
+
+                try
+                {
+                    var data = JsonUtility.FromJson<ServerListResponse>(wr.downloadHandler.text);
+                    var servers = data?.servers ?? Array.Empty<ServerEntry>();
+                    _serverCount = servers.Length;
+
+                    var names = new List<string>();
+                    foreach (var s in servers)
+                    {
+                        var display = string.IsNullOrEmpty(s.name) ? "未命名后端" : s.name;
+                        if (s.kind == "offline")
+                        {
+                            display += " ✕不可达";
+                        }
+                        else if (s.engine)
+                        {
+                            display += " ⚡";
+                        }
+                        names.Add(display);
+                    }
+                    ChatSpeechConfig.Instance.SpeechServerNames = string.Join("|", names.ToArray());
+
+                    if (ChatSpeechConfig.Instance.SpeechServerIndex >= _serverCount)
+                    {
+                        ChatSpeechConfig.Instance.SpeechServerIndex = 0;
+                    }
+                    if (ChatSpeechConfig.Instance.SpeechServerIndex < 0)
+                    {
+                        ChatSpeechConfig.Instance.SpeechServerIndex = 0;
+                    }
+                    ChatSpeechConfig.Instance.Save();
+                    Logger.Info($"[TTS] Loaded {_serverCount} backend server(s): {ChatSpeechConfig.Instance.SpeechServerNames}");
+                }
+                catch (Exception e)
+                {
+                    Logger.Warn($"[TTS] Failed to parse server list: {e.Message}");
+                    _serverCount = 0;
+                }
+            }
         }
 
         private IEnumerator FetchVoicesCoroutine()
         {
-            // Build the voices endpoint URL from the TTS server URL
-            var ttsUrl = NormalizeServerUrl(ChatSpeechConfig.instance.SpeechServerUrl);
-            Uri baseUri;
-            try
+            var url = BuildUrl("/api/voices", true);
+            using (var wr = UnityWebRequest.Get(url))
             {
-                baseUri = new Uri(ttsUrl);
-            }
-            catch (UriFormatException)
-            {
-                Logger.Warn($"TTS: Invalid server URL, cannot fetch voices: {ttsUrl}");
-                yield break;
-            }
-
-            var voicesUrl = new Uri(baseUri, "/api/voices").ToString();
-
-            using (var wr = UnityWebRequest.Get(voicesUrl))
-            {
-                wr.timeout = 5;
+                wr.timeout = 15;
                 wr.certificateHandler = new BypassCertificate();
                 yield return wr.SendWebRequest();
 
-                if (wr.result == UnityWebRequest.Result.Success)
+                if (wr.result != UnityWebRequest.Result.Success)
                 {
-                    try
-                    {
-                        var rawJson = wr.downloadHandler.text;
-                        Logger.Info($"[TTS] Voices response length: {rawJson.Length}");
+                    Logger.Warn($"[TTS] Could not fetch voice list ({wr.responseCode}): {wr.error}");
+                    yield break;
+                }
 
-                        // Manual parsing — avoid JsonUtility issues with non-ASCII descriptions
-                        var voiceNames = new List<object> { "default" };
-                        var namePrefix = "\"name\":\"";
-                        var idx = 0;
-                        while ((idx = rawJson.IndexOf(namePrefix, idx, StringComparison.Ordinal)) >= 0)
+                try
+                {
+                    var raw = wr.downloadHandler.text;
+                    var data = JsonUtility.FromJson<VoiceListResponse>(raw);
+                    var voiceNames = new List<string> { "default" };
+                    if (data?.voices != null)
+                    {
+                        foreach (var v in data.voices)
                         {
-                            idx += namePrefix.Length;
-                            var end = rawJson.IndexOf("\"", idx, StringComparison.Ordinal);
-                            if (end > idx)
+                            if (!string.IsNullOrEmpty(v.name) && !voiceNames.Contains(v.name))
                             {
-                                var name = rawJson.Substring(idx, end - idx);
-                                if (!string.IsNullOrEmpty(name) && !voiceNames.Contains(name))
-                                    voiceNames.Add(name);
+                                voiceNames.Add(v.name);
                             }
                         }
-
-                        Logger.Info($"[TTS] Loaded {voiceNames.Count} voice(s): {string.Join(", ", voiceNames)}");
-                        // Save to config file so it persists across restarts
-                        ChatSpeechConfig.instance.SpeechVoices = string.Join(",", voiceNames);
-                        ChatSpeechConfig.instance.Save();
                     }
-                    catch (Exception e)
+                    var versionNames = new List<string>();
+                    if (data?.versions != null)
                     {
-                        Logger.Warn($"[TTS] Failed to parse voice list: {e.Message}");
+                        foreach (var v in data.versions)
+                        {
+                            if (!string.IsNullOrEmpty(v.name) && !versionNames.Contains(v.name))
+                            {
+                                versionNames.Add(v.name);
+                            }
+                        }
                     }
+
+                    var cfg = ChatSpeechConfig.Instance;
+                    cfg.SpeechVoices = string.Join(",", voiceNames.ToArray());
+                    cfg.SpeechVersions = string.Join(",", versionNames.ToArray());
+
+                    // 首次运行时采用服务器默认值
+                    if (string.IsNullOrEmpty(cfg.SpeechVoice) || !voiceNames.Contains(cfg.SpeechVoice))
+                    {
+                        cfg.SpeechVoice = !string.IsNullOrEmpty(data?.default_voice) && voiceNames.Contains(data.default_voice)
+                            ? data.default_voice
+                            : (voiceNames.Count > 1 ? voiceNames[1] : "default");
+                    }
+                    if (!string.IsNullOrEmpty(cfg.SpeechVersion) && !versionNames.Contains(cfg.SpeechVersion))
+                    {
+                        cfg.SpeechVersion = string.Empty;
+                    }
+                    cfg.Save();
+
+                    Logger.Info($"[TTS] Loaded {voiceNames.Count} voice(s): {cfg.SpeechVoices}");
+                    Logger.Info($"[TTS] Loaded {versionNames.Count} version(s): {cfg.SpeechVersions} (selected: \"{cfg.SpeechVersion}\")");
                 }
-                else
+                catch (Exception e)
                 {
-                    Logger.Warn(
-                        $"TTS: Could not fetch voice list ({wr.responseCode}). " +
-                        "Using default voice only."
-                    );
+                    Logger.Warn($"[TTS] Failed to parse voice list: {e.Message}");
                 }
             }
         }
@@ -413,90 +455,123 @@ namespace EnhancedStreamChat.Chat
 
         private IEnumerator RequestAndPlayTTS(string speaker, string text)
         {
-            var serverUrl = NormalizeServerUrl(ChatSpeechConfig.instance.SpeechServerUrl);
-            var voice = ChatSpeechConfig.instance.SpeechVoice;
-            var speed = ChatSpeechConfig.instance.SpeechSpeed;
+            var cfg = ChatSpeechConfig.Instance;
+            var url = BuildUrl("/api/tts", true, cfg.SpeechServerIndex);
 
-            // Build JSON payload — separate speaker from text for backend caching
             var ttsRequest = new TTSRequestBody
             {
-                speaker = speaker ?? "",
+                speaker = speaker ?? string.Empty,
                 text = text,
-                voice = voice,
-                speed = speed
+                voice = string.IsNullOrEmpty(cfg.SpeechVoice) ? "default" : cfg.SpeechVoice,
+                version = cfg.SpeechVersion ?? string.Empty,
+                speed = Mathf.Clamp(cfg.SpeechSpeed, 0.5f, 2.0f)
             };
             var jsonPayload = JsonUtility.ToJson(ttsRequest);
 
-            Logger.Info($"[TTS] Requesting: POST {serverUrl}");
+            Logger.Info($"[TTS] Requesting: POST {url}");
             Logger.Info($"[TTS] Payload: {jsonPayload}");
-            var hexBytes = BitConverter.ToString(Encoding.UTF8.GetBytes(text));
-            Logger.Info($"[TTS] Text bytes (hex): {hexBytes}");
 
-            using (var wr = new UnityWebRequest(serverUrl, "POST"))
+            const int maxAttempts = 2;
+            for (var attempt = 1; attempt <= maxAttempts; attempt++)
             {
-                var bodyRaw = Encoding.UTF8.GetBytes(jsonPayload);
-                wr.uploadHandler = new UploadHandlerRaw(bodyRaw);
-                wr.downloadHandler = new DownloadHandlerBuffer();
-                wr.SetRequestHeader("Content-Type", "application/json");
-                wr.timeout = 60; // TTS inference can take 20-40s
-                // Bypass SSL cert check for self-signed / LAN servers
-                wr.certificateHandler = new BypassCertificate();
-
-                Logger.Info($"[TTS] Sending HTTP request to {serverUrl}...");
-
-                yield return wr.SendWebRequest();
-
-                Logger.Info($"[TTS] HTTP response: code={wr.responseCode}, result={wr.result}, error=\"{wr.error}\"");
-
-                if (wr.result == UnityWebRequest.Result.Success)
+                var retry = false;
+                using (var wr = new UnityWebRequest(url, "POST"))
                 {
-                    var audioData = wr.downloadHandler.data;
-                    var contentType = wr.GetResponseHeader("Content-Type") ?? "unknown";
-                    Logger.Info($"[TTS] Response: {audioData?.Length ?? 0} bytes, content-type: {contentType}");
+                    wr.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(jsonPayload));
+                    wr.downloadHandler = new DownloadHandlerBuffer();
+                    wr.SetRequestHeader("Content-Type", "application/json");
+                    wr.SetRequestHeader("Accept", "audio/wav, application/json");
+                    wr.timeout = 300; // 冷启动推理可能需要 100s 以上
+                    wr.certificateHandler = new BypassCertificate();
 
-                    if (audioData != null && audioData.Length > 0)
+                    yield return wr.SendWebRequest();
+
+                    Logger.Info($"[TTS] HTTP response: code={wr.responseCode}, result={wr.result}, version={wr.GetResponseHeader("x-tts-version")} (attempt {attempt}/{maxAttempts})");
+
+                    if (wr.result == UnityWebRequest.Result.Success)
                     {
-                        // Check if server returned JSON error instead of WAV
-                        if (contentType.Contains("json") || (audioData.Length < 100 && audioData[0] == '{'))
+                        var audioData = wr.downloadHandler.data;
+                        var contentType = wr.GetResponseHeader("Content-Type") ?? "unknown";
+                        if (audioData != null && audioData.Length > 0)
                         {
-                            var jsonResponse = Encoding.UTF8.GetString(audioData);
-                            Logger.Warn($"[TTS] Server returned JSON instead of audio: {jsonResponse}");
+                            if (contentType.Contains("json") || (audioData.Length < 256 && audioData[0] == (byte)'{'))
+                            {
+                                Logger.Warn($"[TTS] Server returned JSON instead of audio: {Encoding.UTF8.GetString(audioData)}");
+                            }
+                            else
+                            {
+                                Logger.Info($"[TTS] Received {audioData.Length} bytes ({contentType}), playing...");
+                                yield return StartCoroutine(PlayAudioFromBytes(audioData));
+                            }
                         }
                         else
                         {
-                            Logger.Info($"[TTS] Received {audioData.Length} bytes of audio, playing...");
-                            yield return StartCoroutine(PlayAudioFromBytes(audioData));
+                            Logger.Warn("[TTS] Server returned empty audio data");
                         }
+                        yield break;
+                    }
+
+                    if (wr.responseCode == 400)
+                    {
+                        Logger.Warn($"[TTS] Server rejected text (400): {wr.downloadHandler?.text}");
+                        yield break;
+                    }
+
+                    if (wr.responseCode == 503)
+                    {
+                        // 引擎冷启动/正在换模型时会出现，稍后重试一次
+                        Logger.Warn($"[TTS] Server not ready (503): {wr.downloadHandler?.text}");
+                        retry = true;
+                    }
+                    else if (wr.responseCode == 0 || wr.result == UnityWebRequest.Result.ConnectionError)
+                    {
+                        Logger.Warn($"[TTS] Connection failed: {wr.error}");
+                        retry = true;
                     }
                     else
                     {
-                        Logger.Warn("[TTS] Server returned empty audio data");
+                        Logger.Warn($"[TTS] HTTP request FAILED (code={wr.responseCode}): {wr.error}");
+                        yield break;
                     }
                 }
-                else if (wr.responseCode == 400)
+
+                if (retry && attempt < maxAttempts)
                 {
-                    Logger.Warn($"[TTS] Server rejected text (400): {wr.downloadHandler.text}");
+                    Logger.Info("[TTS] Retrying in 3s...");
+                    yield return new WaitForSeconds(3f);
+                    continue;
                 }
-                else if (wr.responseCode == 503)
-                {
-                    Logger.Warn("[TTS] Server not ready (503) — skipping message");
-                }
-                else
-                {
-                    Logger.Warn($"[TTS] HTTP request FAILED (code={wr.responseCode}): {wr.error}");
-                }
+                yield break;
             }
+        }
+
+        /// <summary>
+        /// 拼接请求 URL。appendServer=true 时附加 ?_srv=&lt;下标&gt; 指定合成后端。
+        /// </summary>
+        private string BuildUrl(string path, bool appendServer, int serverIndex = -1)
+        {
+            var url = ChatSpeechConfig.Instance.ServerBaseUrl.TrimEnd('/') + path;
+            if (appendServer && _serverCount > 0)
+            {
+                var idx = serverIndex >= 0 ? serverIndex : ChatSpeechConfig.Instance.SpeechServerIndex;
+                if (idx < 0 || idx >= _serverCount) idx = 0;
+                url += "?_srv=" + idx.ToString();
+            }
+            return url;
         }
 
         // ── Audio Playback ────────────────────────────────────────
 
         private IEnumerator PlayAudioFromBytes(byte[] audioData)
         {
-            // Write audio bytes to temp file
-            Logger.Info($"[TTS] Writing {audioData.Length} bytes to {_tempAudioPath}");
+            // 每次请求用独立临时文件，避免测试朗读与队列朗读互相覆盖
+            var tempAudioPath = Path.Combine(
+                Application.temporaryCachePath,
+                $"tts_speech_{Guid.NewGuid():N}.wav");
+
             try
             {
-                File.WriteAllBytes(_tempAudioPath, audioData);
+                File.WriteAllBytes(tempAudioPath, audioData);
             }
             catch (Exception e)
             {
@@ -504,54 +579,43 @@ namespace EnhancedStreamChat.Chat
                 yield break;
             }
 
-            // Load AudioClip from temp file
-            // Use file:/// URI (proper absolute-path format on all platforms)
-            var filePath = _tempAudioPath.Replace('\\', '/');
-            using (var wr = UnityWebRequestMultimedia.GetAudioClip(
-                "file:///" + filePath, AudioType.WAV))
+            var filePath = tempAudioPath.Replace('\\', '/');
+            using (var wr = UnityWebRequestMultimedia.GetAudioClip("file:///" + filePath, AudioType.WAV))
             {
-                wr.certificateHandler = new BypassCertificate();
                 yield return wr.SendWebRequest();
-
-                Logger.Info($"[TTS] Loading audio from temp file...");
 
                 if (wr.result == UnityWebRequest.Result.Success)
                 {
                     var clip = DownloadHandlerAudioClip.GetContent(wr);
-                    Logger.Info($"[TTS] AudioClip loaded: length={clip?.length ?? 0}s, channels={clip?.channels ?? 0}");
                     if (clip != null)
                     {
-                        _audioSource.volume = ChatSpeechConfig.instance.SpeechVolume;
+                        _gainFilter.Gain = ChatSpeechConfig.Instance.SpeechVolume;
                         _audioSource.clip = clip;
                         _audioSource.Play();
 
-                        Logger.Info($"[TTS] Playing audio ({clip.length:F1}s) at volume {_audioSource.volume}");
+                        Logger.Info($"[TTS] Playing audio ({clip.length:F1}s) at gain {_gainFilter.Gain:F2}");
 
-                        // Wait for playback to finish (or until stopped)
                         while (_audioSource.isPlaying)
                         {
                             yield return null;
                         }
 
-                        // Clean up the clip
                         _audioSource.clip = null;
                         Destroy(clip);
                     }
                 }
                 else
                 {
-                    Logger.Warn($"TTS: Failed to load audio clip: {wr.error}");
-                    // Try to clean up
+                    Logger.Warn($"[TTS] Failed to load audio clip: {wr.error}");
                     _audioSource.clip = null;
                 }
             }
 
-            // Clean temp file
             try
             {
-                if (File.Exists(_tempAudioPath))
+                if (File.Exists(tempAudioPath))
                 {
-                    File.Delete(_tempAudioPath);
+                    File.Delete(tempAudioPath);
                 }
             }
             catch { /* ignore cleanup errors */ }
@@ -559,84 +623,48 @@ namespace EnhancedStreamChat.Chat
 
         // ── Text Processing ───────────────────────────────────────
 
-        /// <summary>
-        /// Remove rich text / HTML tags from a message for clean TTS input.
-        /// Also removes common emote/badge markup patterns.
-        /// </summary>
         internal static string StripRichText(string message)
         {
             if (string.IsNullOrEmpty(message)) return string.Empty;
-
-            // Remove HTML/rich text tags
             var result = RichTextRegex.Replace(message, string.Empty);
-
-            // Collapse multiple whitespace into single space
             result = Regex.Replace(result, @"\s+", " ");
-
             return result.Trim();
         }
 
-        /// <summary>
-        /// Normalize a TTS server address into a full URL.
-        /// Accepts: "host:port", "http://host:port", "host:port/api/tts", "http://host:port/api/tts"
-        /// </summary>
-        private static string NormalizeServerUrl(string url)
-        {
-            if (string.IsNullOrEmpty(url)) return url;
-
-            var normalized = url.Trim();
-
-            // Add scheme if missing (force HTTPS — Unity 2022 blocks HTTP at transport level)
-            if (!normalized.StartsWith("http://") && !normalized.StartsWith("https://"))
-                normalized = "https://" + normalized;
-
-            // Add /api/tts path if missing
-            if (!normalized.EndsWith("/api/tts"))
-            {
-                if (normalized.EndsWith("/"))
-                    normalized += "api/tts";
-                else
-                {
-                    // Check if it already has a path like /api/tts
-                    var uri = new Uri(normalized);
-                    if (uri.AbsolutePath == "/" || string.IsNullOrEmpty(uri.AbsolutePath))
-                        normalized = normalized.TrimEnd('/') + "/api/tts";
-                }
-            }
-
-            Logger.Debug($"TTS: Normalized URL: {url} -> {normalized}");
-            return normalized;
-        }
-
-        /// <summary>
-        /// Bypass SSL certificate validation for self-signed or LAN servers.
-        /// </summary>
+        /// <summary>Bypass SSL certificate validation for self-signed / LAN servers.</summary>
         private class BypassCertificate : CertificateHandler
         {
-            protected override bool ValidateCertificate(byte[] certificateData)
-            {
-                return true; // Accept all certificates
-            }
+            protected override bool ValidateCertificate(byte[] certificateData) => true;
         }
+    }
 
-        private static string EscapeJson(string s)
+    /// <summary>
+    /// AudioGainFilter: Unity 的 AudioSource.volume 上限是 1.0，
+    /// 这里在音频线程对采样做增益，实现 0~200% 音量（超出部分硬限幅）。
+    /// </summary>
+    public class AudioGainFilter : MonoBehaviour
+    {
+        public volatile float Gain = 1f;
+
+        private void OnAudioFilterRead(float[] data, int channels)
         {
-            if (string.IsNullOrEmpty(s)) return string.Empty;
-
-            var sb = new StringBuilder(s.Length + 10);
-            foreach (var c in s)
+            var gain = this.Gain;
+            if (gain <= 0.0001f)
             {
-                switch (c)
-                {
-                    case '\\': sb.Append("\\\\"); break;
-                    case '"': sb.Append("\\\""); break;
-                    case '\n': sb.Append("\\n"); break;
-                    case '\r': sb.Append("\\r"); break;
-                    case '\t': sb.Append("\\t"); break;
-                    default: sb.Append(c); break;
-                }
+                Array.Clear(data, 0, data.Length);
+                return;
             }
-            return sb.ToString();
+            if (Mathf.Abs(gain - 1f) < 0.0001f)
+            {
+                return;
+            }
+            for (var i = 0; i < data.Length; i++)
+            {
+                var v = data[i] * gain;
+                if (v > 1f) v = 1f;
+                else if (v < -1f) v = -1f;
+                data[i] = v;
+            }
         }
     }
 }

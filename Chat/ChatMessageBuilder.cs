@@ -1,254 +1,315 @@
-﻿using ChatCore.Interfaces;
-using ChatCore.Models;
-using ChatCore.Models.Bilibili;
-using ChatCore.Models.Twitch;
+using CatCore.Models.Shared;
+using CatCore.Models.Twitch.Media;
 using EnhancedStreamChat.Graphics;
+using EnhancedStreamChat.Interfaces;
 using EnhancedStreamChat.Utilities;
 using System;
-using System.IO;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using UnityEngine;
-using static UnityEngine.RectTransform;
 
 namespace EnhancedStreamChat.Chat
 {
     public class ChatMessageBuilder
     {
-        public static ObjectMemoryPool<ConcurrentStack<EnhancedImageInfo>> ImageStackPool { get; }
+        private readonly ChatImageProvider _chatImageProvider;
+        private static readonly ConcurrentDictionary<string, Color> s_senderColor = new ConcurrentDictionary<string, Color>();
+#if BS_1423
+        private const string CompactPrefixSeparator = "<space=0.04em>";
+        private const string CompactPrefixIconTighten = "<space=0.02em>";
+        private const string CompactMetadataPairTighten = "<space=-0.16em>";
+        private const string CompactMetadataToNameSeparator = "<space=0.14em>";
+        private const float BadgeNameSeparatorBaseAspectRatio = 1.60f;
+        private const float BadgeNameSeparatorBaseEm = 0.14f;
+        private const float BadgeNameSeparatorPerAspectRatio = 0.38f;
+        private const float BadgeNameSeparatorMaxBonusEm = 0.48f;
+#else
+        private const string CompactPrefixSeparator = "<space=-0.14em>";
+        private const string CompactPrefixIconTighten = "<space=-0.10em>";
+#endif
+        private readonly System.Random _random = new System.Random(Environment.TickCount);
 
-        static ChatMessageBuilder()
+        private static string TruncateForTask14Debug(string text, int max = 180)
         {
-            ImageStackPool = new ObjectMemoryPool<ConcurrentStack<EnhancedImageInfo>>(5, null, null, null, f => f.Clear());
+            if (string.IsNullOrEmpty(text) || max <= 0) {
+                return string.Empty;
+            }
+            if (text.Length <= max) {
+                return text;
+            }
+            return text.Substring(0, max) + "...(truncated)";
         }
 
+#if BADGE_DEBUG
+        private static DateTime s_nextTask14LogUtc = DateTime.MinValue;
+
+        private static bool ShouldLogTask14Debug()
+        {
+            var now = DateTime.UtcNow;
+            if (now < s_nextTask14LogUtc) {
+                return false;
+            }
+
+            s_nextTask14LogUtc = now.AddMinutes(1);
+            return true;
+        }
+#endif
+
+        public ChatMessageBuilder(ChatImageProvider chatImageProvider)
+        {
+            this._chatImageProvider = chatImageProvider;
+        }
 
         /// <summary>
         /// This function *blocks* the calling thread, and caches all the images required to display the message, then registers them with the provided font.
         /// </summary>
         /// <param name="msg">The chat message to get images from</param>
         /// <param name="font">The font to register these images to</param>
-        public static bool PrepareImages(IChatMessage msg, EnhancedFontInfo font)
+
+        public async Task<bool> PrepareImages(IESCChatMessage msg, EnhancedFontInfo font)
         {
-            Logger.Debug($"Preparing images for message: {msg.Message}");
             var tasks = new List<Task<EnhancedImageInfo>>();
             var pendingEmoteDownloads = new HashSet<string>();
+            var metadataImages = this.GetMetadataImages(msg);
+            var metadataRegisteredCount = 0;
 
             foreach (var emote in msg.Emotes) {
                 if (string.IsNullOrEmpty(emote.Id) || pendingEmoteDownloads.Contains(emote.Id)) {
-                    Logger.Warn($"Emote {emote.Name} was missing from the emote dict! The request to {emote.Uri} may have timed out?");
                     continue;
                 }
                 if (!font.CharacterLookupTable.ContainsKey(emote.Id)) {
-                    Logger.Info($"characterLookupTable not contains emote {emote.Id}, characterLookupTable: {font.CharacterLookupTable}");
-                    pendingEmoteDownloads.Add(emote.Id);
-                    var tcs = new TaskCompletionSource<EnhancedImageInfo>();
-                    switch (emote.Type) {
-                        case EmoteType.SingleImage:
-                            Logger.Debug("[ChatMessageBuilder] | [PrepareImages] | [SingleImage] | Emote: ID: " + emote.Id + " Uri: " + emote.Uri + " IsAnimated: " + emote.IsAnimated);
-                            var IsAnimated = emote.IsAnimated;
-                            switch (Path.GetExtension(emote.Uri)) {
-                                case ".jpg":
-                                case ".png":
-                                case ".bmp":
-                                    IsAnimated = false;
-                                    break;
-                                case ".gif":
-                                    IsAnimated = true;
-                                    break;
+                    await MainThreadInvoker.Invoke(() =>
+                    {
+                        _ = pendingEmoteDownloads.Add(emote.Id);
+                        var tcs = new TaskCompletionSource<EnhancedImageInfo>();
+                        _ = SharedCoroutineStarter.Instance.StartCoroutine(this._chatImageProvider.TryCacheSingleImage(emote.Id, emote.Url, emote.Animated ? ChatImageProvider.ESCAnimationType.GIF : ChatImageProvider.ESCAnimationType.MAYBE_GIF, (info) =>
+                        {
+                            if (info == null || !font.TryRegisterImageInfo(info, out var character)) {
+                                Logger.Warn($"Failed to register emote \"{emote.Id}\" in font {font.Font.name}.");
                             }
-                            // SharedCoroutineStarter.instance.StartCoroutine(ChatImageProvider.instance.TryCacheSingleImage(emote.Id, emote.Uri, IsAnimated, (info) =>
-                            Logger.Debug("[ChatMessageBuilder] | [PrepareImages] | [SingleImage] | start cache image Emote: ID:" + emote.Id + " Uri: " + emote.Uri);
-                            CoroutineRunner.Instance.StartCoroutine(ChatImageProvider.instance.TryCacheSingleImage(emote.Id, emote.Uri, IsAnimated, (info) =>
+                            tcs.SetResult(info);
+                        }, forcedHeight: 110));
+                        tasks.Add(tcs.Task);
+                    });
+                }
+            }
+
+            foreach (var metadataImage in metadataImages) {
+                if (string.IsNullOrEmpty(metadataImage.Id) || string.IsNullOrEmpty(metadataImage.Url) || pendingEmoteDownloads.Contains(metadataImage.Id)) {
+                    continue;
+                }
+                if (!font.CharacterLookupTable.ContainsKey(metadataImage.Id)) {
+                    await MainThreadInvoker.Invoke(() =>
+                    {
+                        _ = pendingEmoteDownloads.Add(metadataImage.Id);
+                        var tcs = new TaskCompletionSource<EnhancedImageInfo>();
+                        _ = SharedCoroutineStarter.Instance.StartCoroutine(this._chatImageProvider.TryCacheSingleImage(metadataImage.Id, metadataImage.Url,
+                            metadataImage.Animated ? ChatImageProvider.ESCAnimationType.GIF : ChatImageProvider.ESCAnimationType.MAYBE_GIF, (info) =>
                             {
-                                Logger.Debug($"try cache image Emote: ID: {emote.Id}, Uri: {emote.Uri}, IsAnimated: {IsAnimated}, info: {info}");
-                                if (info != null) {
-                                    if (!font.TryRegisterImageInfo(info, out var character)) {
-                                        Logger.Warn($"Failed to register emote \"{emote.Id}\" in font {font.Font.name}.");
-                                    }
-                                    Logger.Debug($"register emote \"{emote.Id}\" in font {font.Font.name}, character: {character}, character: {char.ConvertFromUtf32((int)character)}, character int: {(int)character}, info: {info}");
+                                if (info != null && font.TryRegisterImageInfo(info, out var _)) {
+                                    metadataRegisteredCount++;
+                                }
+                                else {
+                                    Logger.Warn($"Failed to register metadata image \"{metadataImage.Id}\" in font {font.Font.name}.");
                                 }
                                 tcs.SetResult(info);
-                            }, forcedHeight: (int)Math.Ceiling(ChatConfig.instance.FontSize * 15)));
-                            break;
-                        case EmoteType.SpriteSheet:
-                            Logger.Debug("[ChatMessageBuilder] | [PrepareImages] | [SpriteSheet] | start cache SpriteSheet Emote: ID: " + emote.Id + " Uri: " + emote.Uri);
-                            // SharedCoroutineStarter.instance.StartCoroutine(ChatImageProvider.instance.TryCacheSpriteSheetImage(emote.Id, emote.Uri, emote.UVs, (info) =>
-                            CoroutineRunner.Instance.StartCoroutine(ChatImageProvider.instance.TryCacheSpriteSheetImage(emote.Id, emote.Uri, emote.UVs, (info) =>
+                            }, forcedHeight: metadataImage.ForcedHeight));
+                        tasks.Add(tcs.Task);
+                    });
+                }
+            }
+
+            if (msg.Sender is IChatUserWithBadges userWithBadges) {
+                foreach (var badge in userWithBadges.Badges) {
+                    if (string.IsNullOrEmpty(badge.Id) || pendingEmoteDownloads.Contains(badge.Id)) {
+                        continue;
+                    }
+                    if (!font.CharacterLookupTable.ContainsKey(badge.Id)) {
+                        await MainThreadInvoker.Invoke(() =>
+                        {
+                            _ = pendingEmoteDownloads.Add(badge.Id);
+                            var tcs = new TaskCompletionSource<EnhancedImageInfo>();
+                            _ = SharedCoroutineStarter.Instance.StartCoroutine(this._chatImageProvider.TryCacheSingleImage(badge.Id, badge.Uri, ChatImageProvider.ESCAnimationType.NONE, (info) =>
                             {
-                                Logger.Debug($"try cache SpriteSheet Emote: ID: {emote.Id}, Uri: {emote.Uri}, UVs: {emote.UVs}");
                                 if (info != null) {
                                     if (!font.TryRegisterImageInfo(info, out var character)) {
-                                        Logger.Warn($"Failed to register emote \"{emote.Id}\" in font {font.Font.name}.");
+                                        Logger.Warn($"Failed to register badge \"{badge.Id}\" in font {font.Font.name}.");
                                     }
-                                    Logger.Debug($"register emote \"{emote.Id}\" in font {font.Font.name}, character: {character}, character: {char.ConvertFromUtf32((int)character)}, character int: {(int)character}, info: {info}");
                                 }
                                 tcs.SetResult(info);
                             }, forcedHeight: 110));
-                            break;
-                        default:
-                            tcs.SetResult(null);
-                            Logger.Warn($"Unknown emote type {emote.Type} for emote {emote.Name}!");
-                            break;
+                            tasks.Add(tcs.Task);
+                        });
                     }
-                    tasks.Add(tcs.Task);
                 }
             }
-
-            Logger.Info($"Preparing badges for message: {msg.Message}");
-            foreach (var badge in msg.Sender.Badges) {
-                if (string.IsNullOrEmpty(badge.Id) || pendingEmoteDownloads.Contains(badge.Id)) {
-                    Logger.Warn($"Badge {badge.Name} was missing from the badge dict! The request to {badge.Uri} may have timed out?");
-                    continue;
-                }
-
-                Logger.Debug("Badges: ID: " + badge.Id + " NAME: " + badge.Name + " URL: " + badge.Uri);
-                if (!font.CharacterLookupTable.ContainsKey(badge.Id)) {
-                    Logger.Debug($"characterLookupTable not contains badge {badge.Id}, characterLookupTable: {font.CharacterLookupTable}");
-                    pendingEmoteDownloads.Add(badge.Id);
-                    var tcs = new TaskCompletionSource<EnhancedImageInfo>();
-                    // SharedCoroutineStarter.instance.StartCoroutine(ChatImageProvider.instance.TryCacheSingleImage(badge.Id, badge.Uri, false, (info) =>
-                    CoroutineRunner.Instance.StartCoroutine(ChatImageProvider.instance.TryCacheSingleImage(badge.Id, badge.Uri, false, (info) =>
-                    {
-                        Logger.Debug($"try cache image Badge: ID: {badge.Id}, Uri: {badge.Uri}, info: {info}");
-                        if (info != null) {
-                            if (!font.TryRegisterImageInfo(info, out var character)) {
-                                Logger.Warn($"Failed to register badge \"{badge.Id}\" in font {font.Font.name}.");
-                            }
-                            Logger.Debug($"register badge \"{badge.Id}\" in font {font.Font.name}, character: {character}, character: {char.ConvertFromUtf32((int)character)}, character int: {(int)character}, info: {info}");
-                        }
-                        tcs.SetResult(info);
-                    }, forcedHeight: (int)Math.Ceiling(ChatConfig.instance.FontSize * 15)));
-                    tasks.Add(tcs.Task);
-                }
-            }
-
             // Wait on all the resources to be ready
-            return Task.WaitAll(tasks.ToArray(), 15000);
+            var result = await Task.WhenAll(tasks);
+            #if BADGE_DEBUG
+            if (metadataImages.Count > 0 && ShouldLogTask14Debug()) {
+                Logger.Debug($"BILI_METADATA_IMAGE_PREPARE msg={msg.Id} requested={metadataImages.Count} registered={metadataRegisteredCount}");
+            }
+            #endif
+            return result.All(x => x != null);
         }
 
-        public static Task<string> BuildMessage(IChatMessage msg, EnhancedFontInfo font) => Task.Run(() =>
+        public async Task<string> BuildMessage(IESCChatMessage msg, EnhancedFontInfo font, BuildMessageTarget buildMessage, bool shouldPrepareImages = true)
         {
             try {
-                // Logger.Debug($"Building message: {msg.Message}");
-
-                if (!PrepareImages(msg, font)) {
+                if (shouldPrepareImages && !await this.PrepareImages(msg, font)) {
                     Logger.Warn($"Failed to prepare some/all images for msg \"{msg.Message}\"!");
                     //return msg.Message;
                 }
-                // Logger.Debug($"Images prepared for message: {msg.Message}");
-
-                var badges = ImageStackPool.Alloc();
-                try {
-                    foreach (var badge in msg.Sender.Badges)
-                    {
-                        if (badge != null && !string.IsNullOrEmpty(badge.Id))
-                        {
-                            // Logger.Debug("Badges: ID: " + badge.Id + " NAME: " + badge.Name + " URL: " + badge.Uri);
-                            if (!ChatImageProvider.instance.CachedImageInfo.TryGetValue(badge.Id, out var badgeInfo))
-                            {
-                                Logger.Warn($"Failed to find cached image info for badge \"{badge.Id}\"!");
-                                continue;
-                            }
-                            badges.Push(badgeInfo);
-                        }
+                var badges = new Stack<EnhancedImageInfo>();
+                var isBilibiliMessage = msg.Metadata.TryGetValue("platform", out var platform) && platform == "bilibili";
+                var prefixImageIds = new List<string>();
+                var senderBadgeImageIds = new List<string>();
+                var metadataPrefixImageIds = new List<string>();
+                var avatarPrefixImageIds = new List<string>();
+                if (msg.Sender is IChatUserWithBadges userWithBadges) {
+                    foreach (var badge in userWithBadges.Badges) {
+                        senderBadgeImageIds.Add(badge.Id);
                     }
                 }
-                catch (Exception ex)
-                {
-                    Logger.Error($"An exception occurred in ChatMessageBuilder while parsing badges. Msg: \"{msg.Message}\". {ex.ToString()}");
-                }
-
-                var sb = new StringBuilder(msg.Message); // Replace all instances of < with a zero-width non-breaking character
-                // Logger.Debug($"Message: {msg.Message}");
-                // Escape all html tags in the message
-                sb.Replace("<", "<\u2060");
-                // Logger.Debug($"Message sb: {sb.ToString()}");
-                
-                try{
-                    // Logger.Debug("Phase emotes: " + sb.ToString() + ", got " + msg.Emotes.Length + " Emote(s).");
-                    foreach (var emote in msg.Emotes)
-                    {
-                        if (!ChatImageProvider.instance.CachedImageInfo.TryGetValue(emote.Id, out var replace))
-                        {
-                            Logger.Warn($"Emote {emote.Name} was missing from the emote dict! The request to {emote.Uri} may have timed out?");
-                            continue;
-                        }
-                        // Logger.Debug($"Emote: {emote.Name}, StartIndex: {emote.StartIndex}, EndIndex: {emote.EndIndex}, Len: {sb.Length}");
-                        if (!font.TryGetCharacter(replace.ImageId, out var character))
-                        {
-                            Logger.Warn($"Emote {emote.Name} was missing from the character dict! Font hay have run out of usable characters.");
-                            continue;
-                        }
-
-                        /* Logger.Debug("Try to show emotes: " + emote.Name.ToString());*/
-                        try
-                        {
-                             //Replace emotes by index, in reverse order (msg.Emotes is sorted by emote.StartIndex in descending order)
-                            if (msg is BilibiliChatMessage)
-                            {
-                                // Logger.Debug("Emote: ID: " + emote.Id + " NAME: " + emote.Name + " URL: " + emote.Uri);
-                                // todo 图片还有问题，暂时注释掉
-                                // sb.Replace(emote.Name, emote switch
-                                // {
-                                //     BilibiliChatEmote b when true => char.ConvertFromUtf32((int)character),
-                                //     _ => char.ConvertFromUtf32((int)character)
-                                // },
-                                // emote.StartIndex, emote.EndIndex - emote.StartIndex);
-                                // Logger.Debug("Replace " + emote.Name.ToString() + " ==> " + sb.ToString());
-                                // 尝试在font的characterLookupTable中找到对应的character 输出找没找到
-                                // if (ESCFontManager.instance.MainFont.characterLookupTable.TryGetValue(character, out var tmpCharacter))
-                                // {
-                                //     // Logger.Debug($"Font characterLookupTable contains character: {tmpCharacter}, tmpCharacter: {tmpCharacter.unicode}");
-                                // }
-                                // else
-                                // {
-                                //     Logger.Warn("Font characterLookupTable not contains character: " + char.ConvertFromUtf32((int)character));
-                                // }
-                            }
-                            else
-                            {
-                                sb.Replace(emote.Name, emote switch
-                                {
-                                    TwitchEmote t when t.Bits > 0 => $"{char.ConvertFromUtf32((int)character)}\u00A0<color={t.Color}><size=77%><b>{t.Bits}\u00A0</b></size></color>",
-                                    _ => char.ConvertFromUtf32((int)character)
-                                },
-                                emote.StartIndex, emote.EndIndex - emote.StartIndex + 1);
-                                // Logger.Debug("Replace " + emote.Name.ToString() + " ==> " + sb.ToString());
-                                // 尝试在font的characterLookupTable中找到对应的character 输出找没找到
-                                // if (ESCFontManager.instance.MainFont.characterLookupTable.TryGetValue(character, out var tmpCharacter))
-                                // {
-                                //     Logger.Debug($"Font characterLookupTable contains character: {tmpCharacter.ToString()}, tmpCharacter: {tmpCharacter.unicode}");
-                                // }
-                                // else
-                                // {
-                                //     Logger.Warn("Font characterLookupTable not contains character: " + char.ConvertFromUtf32((int)character));
-                                // }
-
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            Logger.Error($"An unknown error occurred while trying to swap emote {emote.Name} into string of length {sb.Length} at location ({emote.StartIndex}, {emote.EndIndex})\r\n{ex}");
-                        }
+                foreach (var metadataImage in this.GetMetadataImages(msg)) {
+                    // Keep emotes out of prefix icons; avatar stays as the left-most prefix image.
+                    if (string.Equals(metadataImage.Kind, "emote", StringComparison.OrdinalIgnoreCase)) {
+                        continue;
                     }
-                }
-                catch (Exception ex)
-                {
-                    Logger.Error($"An exception occurred in ChatMessageBuilder while parsing badges. Msg: \"{msg.Message}\". {ex.ToString()}");
+                    if (string.Equals(metadataImage.Kind, "avatar", StringComparison.OrdinalIgnoreCase)) {
+                        avatarPrefixImageIds.Add(metadataImage.Id);
+                        continue;
+                    }
+                    // Bilibili level/honor icons are tagged as "tag"; keep them in prefix with badges.
+                    var isBadgeKind = string.Equals(metadataImage.Kind, "badge", StringComparison.OrdinalIgnoreCase);
+                    var isTagKind = string.Equals(metadataImage.Kind, "tag", StringComparison.OrdinalIgnoreCase);
+                    if (!isBadgeKind && !isTagKind) {
+                        continue;
+                    }
+                    metadataPrefixImageIds.Add(metadataImage.Id);
                 }
 
-                if (msg.IsSystemMessage) {
-                    // System messages get a grayish color to differenciate them from normal messages in chat, and do not receive a username/badge prefix
-                    sb.Insert(0, $"<color=#bbbbbbbb>");
-                    sb.Append("</color>");
+                if (isBilibiliMessage) {
+                    prefixImageIds.AddRange(avatarPrefixImageIds);
+                    prefixImageIds.AddRange(metadataPrefixImageIds);
+                    prefixImageIds.AddRange(senderBadgeImageIds);
+
+                    if (prefixImageIds.Any(IsBroadcasterPrefixImageId)) {
+                        prefixImageIds = prefixImageIds
+                            .Where(imageId => IsAvatarPrefixImageId(imageId) || IsBroadcasterPrefixImageId(imageId))
+                            .ToList();
+                    }
                 }
                 else {
-                    var nameColorCode = msg.Sender.Color;
-                    Logger.Debug(nameColorCode);
-                    if (ColorUtility.TryParseHtmlString(msg.Sender.Color.Substring(0, 7), out var nameColor)) {
+                    prefixImageIds.AddRange(senderBadgeImageIds);
+                    prefixImageIds.AddRange(metadataPrefixImageIds);
+                    if (avatarPrefixImageIds.Count > 0) {
+                        prefixImageIds.InsertRange(0, avatarPrefixImageIds);
+                    }
+                }
+                foreach (var imageId in prefixImageIds) {
+                    if (!this._chatImageProvider.CachedImageInfo.TryGetValue(imageId, out var badgeInfo)) {
+                        Logger.Warn($"Failed to find cached image info for badge \"{imageId}\"!");
+                        continue;
+                    }
+                    badges.Push(badgeInfo);
+                }
+                var sb = buildMessage == BuildMessageTarget.Main ? new StringBuilder(msg.Message) : new StringBuilder(msg.SubMessage); // Replace all instances of < with a zero-width non-breaking character
+                var shouldTask14Log = false;
+                #if BADGE_DEBUG
+                shouldTask14Log = isBilibiliMessage && buildMessage == BuildMessageTarget.Main && ShouldLogTask14Debug();
+                #endif
+                foreach (var emote in msg.Emotes) {
+                    if (emote is TwitchEmote twitchEmote && 0 < twitchEmote.Bits) {
+                        continue;
+                    }
+                    if (!this._chatImageProvider.CachedImageInfo.TryGetValue(emote.Id, out var replace)) {
+                        Logger.Warn($"Emote {emote.Name} was missing from the emote dict! The request to {emote.Url} may have timed out?");
+                        continue;
+                    }
+                    //Logger.Info($"replase id {replace.ImageId}");
+                    //Logger.Info($"Emote: {emote.Name}, StartIndex: {emote.StartIndex}, EndIndex: {emote.EndIndex}, Len: {sb.Length}");
+                    if (!font.TryGetCharacter(replace.ImageId, out var character)) {
+                        Logger.Warn($"Emote {emote.Name} was missing from the character dict! Font hay have run out of usable characters.");
+                        continue;
+                    }
+                    //Logger.Info($"target char {character}");
+                    try {
+                        if (isBilibiliMessage) {
+                            _ = sb.Replace(emote.Name, char.ConvertFromUtf32((int)character));
+                            continue;
+                        }
+                        // Replace emotes by index, in reverse order (msg.Emotes is sorted by emote.StartIndex in descending order)
+                        if (Regex.IsMatch(emote.Id, "^Emoji_")) {
+                            var charIndexText = Regex.Replace(emote.Id, "^Emoji_", "");
+                            var emojiChars = charIndexText.Split('-').Select(x => char.ConvertFromUtf32(Convert.ToInt32($"0x{x}", 16)));
+                            var emojiBuilder = new StringBuilder();
+                            foreach (var emojiChar in emojiChars) {
+                                _ = emojiBuilder.Append(emojiChar);
+                            }
+                            _ = sb.Replace(emojiBuilder.ToString(), char.ConvertFromUtf32((int)character));
+                        }
+                        else {
+                            _ = sb.Replace(emote.Name, char.ConvertFromUtf32((int)character));
+                        }
+                    }
+                    catch (Exception ex) {
+                        Logger.Error($"An unknown error occurred while trying to swap emote {emote.Name} into string of length {sb.Length} at location ({emote.StartIndex}, {emote.EndIndex})\r\n{ex}");
+                    }
+                }
+                _ = sb.Replace("<", "<\u2060");
+                foreach (var emote in msg.Emotes) {
+                    if (emote is not TwitchEmote twitchEmote || twitchEmote.Bits == 0) {
+                        continue;
+                    }
+                    if (!this._chatImageProvider.CachedImageInfo.TryGetValue(emote.Id, out var replace)) {
+                        Logger.Warn($"Emote {emote.Name} was missing from the emote dict! The request to {emote.Url} may have timed out?");
+                        continue;
+                    }
+                    //Logger.Info($"replase id {replace.ImageId}");
+                    //Logger.Info($"Emote: {emote.Name}, StartIndex: {emote.StartIndex}, EndIndex: {emote.EndIndex}, Len: {sb.Length}");
+                    if (!font.TryGetCharacter(replace.ImageId, out var character)) {
+                        Logger.Warn($"Emote {emote.Name} was missing from the character dict! Font hay have run out of usable characters.");
+                        continue;
+                    }
+                    //Logger.Info($"target char {character}");
+                    try {
+                        // Replace emotes by index, in reverse order (msg.Emotes is sorted by emote.StartIndex in descending order)
+                        _ = sb.Replace(emote.Name, $"{char.ConvertFromUtf32((int)character)}\u00A0<color={twitchEmote.Color}><size=77%><b>{twitchEmote.Bits}\u00A0</b></size></color>");
+                    }
+                    catch (Exception ex) {
+                        Logger.Error($"An unknown error occurred while trying to swap emote {emote.Name} into string of length {sb.Length} at location ({emote.StartIndex}, {emote.EndIndex})\r\n{ex}");
+                    }
+                }
+                if (buildMessage == BuildMessageTarget.Main && msg.IsSystemMessage) {
+                    // System messages get a grayish color to differenciate them from normal messages in chat, and do not receive a username/badge prefix
+                    _ = sb.Insert(0, $"<color=#bbbbbbff>");
+                    _ = sb.Append("</color>");
+                }
+                else {
+                    if (shouldTask14Log) {
+                        var displayNameForTask14 = msg.Sender?.DisplayName ?? string.Empty;
+                        var containsMedalLink = displayNameForTask14.Contains("<link=medal_", StringComparison.Ordinal);
+                        #if BADGE_DEBUG
+                        Logger.Info($"[TASK14DBG][ESC-BUILD] BeforeNameInsert msgId={msg.Id} displayName=\"{TruncateForTask14Debug(displayNameForTask14)}\" containsMedalLink={containsMedalLink}");
+                        #endif
+                        if (!containsMedalLink) {
+                            #if BADGE_DEBUG
+                            Logger.Warn($"[TASK14DBG][ESC-BUILD] msgId={msg.Id} 上游未提供 medal link in DisplayName");
+                            #endif
+                        }
+                    }
+                    var nameColorCode = msg.Sender?.Color;
+                    if (ColorUtility.TryParseHtmlString(nameColorCode?.Substring(0, 7), out var nameColor)) {
+                        if (nameColor == Color.white && !s_senderColor.TryGetValue(msg.Sender?.UserName, out nameColor)) {
+                            nameColor = new Color((float)this._random.Next(0, 100000) / 100000, (float)this._random.Next(0, 100000) / 100000, (float)this._random.Next(0, 100000) / 100000);
+                            _ = s_senderColor.TryAdd(msg.Sender?.UserName, nameColor);
+                        }
                         Color.RGBToHSV(nameColor, out var h, out var s, out var v);
                         if (v < 0.85f) {
                             v = 0.85f;
@@ -259,54 +320,224 @@ namespace EnhancedStreamChat.Chat
                     }
                     if (msg.IsActionMessage) {
                         // Message becomes the color of their name if it's an action message
-                        sb.Insert(0, $"<color={nameColorCode}><b>{msg.Sender.DisplayName}</b> ");
-                        sb.Append("</color>");
-                        // Logger.Debug("Action message: " + sb.ToString());
+                        _ = sb.Insert(0, $"<color={nameColorCode}><b>{msg.Sender?.DisplayName}</b> ");
+                        _ = sb.Append("</color>");
                     }
                     else {
                         // Insert username w/ color
-                        sb.Insert(0, $"<color={nameColorCode}><b>{msg.Sender.DisplayName}</b></color>: ");
-                        // Logger.Debug("Normal message: " + sb.ToString());
+                        _ = sb.Insert(0, $"<color={nameColorCode}><b>{msg.Sender?.DisplayName}</b></color>: ");
                     }
-
-                    try {
-                        // Logger.Debug("Badges: " + msg.Sender.Badges.Length + " Badge(s).");
-                        for (var i = 0; i < msg.Sender.Badges.Length; i++)
-                        {
-                            // Insert user badges at the beginning of the string in reverse order
-                            // if (badges.TryPop(out var badge) && font.TryGetCharacter(badge.ImageId, out var character)) {
-                            if (badges.TryPop(out var badge))
-                            {
-                                if (font.TryGetCharacter(badge.ImageId, out var character))
-                                {
-                                    // sb.Insert(0, $"{char.ConvertFromUtf32((int)character)} "); //todo 图片显示有问题，暂时注释掉
-                                    // Logger.Debug("Badge: " + sb.ToString());
-                                }
-                                /*if (msg is BilibiliChatMessage)
-                                {
-                                }
-                                else if (font.TryGetCharacter(badge.ImageId, out var character)) {
-                                    sb.Insert(0, $"{char.ConvertFromUtf32((int)character)} ");
-                                }*/
-                            }
+                    var parsedBadge = new HashSet<string>();
+                    var insertedPrefixIcon = false;
+                    string previousFrontImageId = null;
+                    while (badges.Count > 0) {
+                        // Insert all prefix images (Twitch badges + metadata images)
+                        var badge = badges.Pop();
+                        if (badge == null || parsedBadge.Contains(badge.ImageId)) {
+                            continue;
                         }
-                        // Logger.Debug("Badges: " + sb.ToString());
-                    } catch (Exception ex)
-                    {
-                        Logger.Error($"An exception occurred in ChatMessageBuilder while replace emotes. Msg: \"{msg.Message}\". {ex.ToString()}");
+                        _ = parsedBadge.Add(badge.ImageId);
+                        if (font.TryGetCharacter(badge.ImageId, out var character)) {
+                            // Keep icon group compact; only the first inserted icon keeps a small separator before username.
+                            var spacingMarkup = insertedPrefixIcon
+                                ? GetPrefixSpacingMarkup(badge.ImageId, previousFrontImageId)
+                                : GetPrefixToNameSpacingMarkup(badge);
+                            _ = sb.Insert(0, $"{char.ConvertFromUtf32((int)character)}{spacingMarkup}");
+                            insertedPrefixIcon = true;
+                            previousFrontImageId = badge.ImageId;
+                        }
+                        else {
+                            Logger.Warn("Undefind badge");
+                        }
                     }
-                    ImageStackPool.Free(badges);
+                    if (shouldTask14Log) {
+                        var builtText = sb.ToString();
+                        var containsMedalLinkAfterInsert = builtText.Contains("<link=medal_", StringComparison.Ordinal);
+                        #if BADGE_DEBUG
+                        Logger.Info($"[TASK14DBG][ESC-BUILD] AfterNameInsert msgId={msg.Id} containsMedalLinkAfterInsert={containsMedalLinkAfterInsert} sbPrefix=\"{TruncateForTask14Debug(builtText, 220)}\"");
+                        #endif
+                    }
                 }
-                // 在开头插一个a，防止textMeshPro的textinfo计算错误
-                // sb.Insert(0, "aaaaaa ");
-
-                // Logger.Debug("Final message: " + sb.ToString());
                 return sb.ToString();
             }
             catch (Exception ex) {
-                Logger.Error($"An exception occurred in ChatMessageBuilder while parsing msg with {msg.Emotes.Length} emotes. Msg: \"{msg.Message}\". {ex.ToString()}");
+                Logger.Error($"An exception occurred in ChatMessageBuilder while parsing msg with {msg.Emotes.Count} emotes. Msg: \"{msg.Message}\". {ex}");
             }
             return msg.Message;
-        });
+        }
+
+        private static bool IsAvatarPrefixImageId(string imageId)
+        {
+            return !string.IsNullOrEmpty(imageId)
+                && imageId.StartsWith("Bili_avatar_", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsBroadcasterPrefixImageId(string imageId)
+        {
+            return !string.IsNullOrEmpty(imageId)
+                && imageId.IndexOf("_broadcaster_", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool IsBilibiliMetadataPrefixImageId(string imageId)
+        {
+            return !string.IsNullOrEmpty(imageId)
+                && imageId.StartsWith("Bili_", StringComparison.OrdinalIgnoreCase)
+                && !IsAvatarPrefixImageId(imageId);
+        }
+
+        private static string GetPrefixSpacingMarkup(string currentImageId, string nextImageId)
+        {
+#if BS_1423
+            if (IsBilibiliMetadataPrefixImageId(currentImageId) && IsBilibiliMetadataPrefixImageId(nextImageId)) {
+                return CompactMetadataPairTighten;
+            }
+#endif
+            return CompactPrefixIconTighten;
+        }
+
+        private static string GetPrefixToNameSpacingMarkup(EnhancedImageInfo currentImageInfo)
+        {
+#if BS_1423
+            var currentImageId = currentImageInfo?.ImageId;
+            if (!string.IsNullOrEmpty(currentImageId)
+                && currentImageId.StartsWith("Bili_badge_", StringComparison.OrdinalIgnoreCase)
+                && currentImageInfo.Height > 0
+                && currentImageInfo.Width > 0) {
+                var aspectRatio = (float)currentImageInfo.Width / currentImageInfo.Height;
+                var extraEm = Math.Max(0f, aspectRatio - BadgeNameSeparatorBaseAspectRatio) * BadgeNameSeparatorPerAspectRatio;
+                if (extraEm > BadgeNameSeparatorMaxBonusEm) {
+                    extraEm = BadgeNameSeparatorMaxBonusEm;
+                }
+
+                return $"<space={(BadgeNameSeparatorBaseEm + extraEm).ToString("0.###", CultureInfo.InvariantCulture)}em>";
+            }
+
+            if (IsBilibiliMetadataPrefixImageId(currentImageId)) {
+                return CompactMetadataToNameSeparator;
+            }
+#endif
+            return CompactPrefixSeparator;
+        }
+
+        private List<MetadataImageResource> GetMetadataImages(IESCChatMessage msg)
+        {
+            var result = new List<MetadataImageResource>();
+            if (msg?.Metadata == null) {
+                return result;
+            }
+
+            // Format A (legacy / current CatCore):
+            //   bili.richimage.count
+            //   bili.richimage.{i}.(id|url|animated|height|kind)
+            if (msg.Metadata.TryGetValue("bili.richimage.count", out var countText)
+                && int.TryParse(countText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var count)
+                && count > 0) {
+                for (var i = 0; i < count; i++) {
+                    if (!msg.Metadata.TryGetValue($"bili.richimage.{i}.id", out var id)
+                        || !msg.Metadata.TryGetValue($"bili.richimage.{i}.url", out var url)
+                        || string.IsNullOrWhiteSpace(id)
+                        || string.IsNullOrWhiteSpace(url)) {
+                        continue;
+                    }
+
+                    var kind = msg.Metadata.TryGetValue($"bili.richimage.{i}.kind", out var kindText) ? kindText : "metadata";
+                    var animated = msg.Metadata.TryGetValue($"bili.richimage.{i}.animated", out var animatedText) && animatedText == "1";
+                    var forcedHeight = GetDefaultForcedHeight(kind);
+                    if (msg.Metadata.TryGetValue($"bili.richimage.{i}.height", out var heightText)
+                        && int.TryParse(heightText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedHeight)
+                        && parsedHeight > 0) {
+                        forcedHeight = parsedHeight;
+                    }
+                    forcedHeight = ApplyBroadcasterMinHeight(id, forcedHeight);
+
+                    result.Add(new MetadataImageResource(id, url, animated, forcedHeight, kind));
+                }
+
+                return result;
+            }
+
+            // Format B (kind-grouped):
+            //   bili.richimage.{i}.{kind}.(id|url|animated|height)
+            // where kind may be avatar|badge|tag|emote
+            const int maxRichImageIndex = 32;
+            var foundAny = false;
+            for (var i = 0; i < maxRichImageIndex; i++) {
+                var addedThisIndex = false;
+                foreach (var kind in s_richImageKinds) {
+                    var prefix = $"bili.richimage.{i}.{kind}.";
+                    if (!msg.Metadata.TryGetValue(prefix + "id", out var id)
+                        || !msg.Metadata.TryGetValue(prefix + "url", out var url)
+                        || string.IsNullOrWhiteSpace(id)
+                        || string.IsNullOrWhiteSpace(url)) {
+                        continue;
+                    }
+
+                    var animated = msg.Metadata.TryGetValue(prefix + "animated", out var animatedText)
+                        && (animatedText == "1" || string.Equals(animatedText, "true", StringComparison.OrdinalIgnoreCase));
+
+                    var forcedHeight = GetDefaultForcedHeight(kind);
+                    if (msg.Metadata.TryGetValue(prefix + "height", out var heightText)
+                        && int.TryParse(heightText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedHeight)
+                        && parsedHeight > 0) {
+                        forcedHeight = parsedHeight;
+                    }
+                    forcedHeight = ApplyBroadcasterMinHeight(id, forcedHeight);
+
+                    result.Add(new MetadataImageResource(id, url, animated, forcedHeight, kind));
+                    foundAny = true;
+                    addedThisIndex = true;
+                }
+
+                // If we've started finding grouped metadata, stop scanning after the first empty index.
+                if (foundAny && !addedThisIndex) {
+                    break;
+                }
+            }
+
+            return result;
+        }
+
+        private static readonly string[] s_richImageKinds = new[] { "avatar", "badge", "tag", "emote" };
+
+        private static int GetDefaultForcedHeight(string kind)
+        {
+            if (string.Equals(kind, "avatar", StringComparison.OrdinalIgnoreCase)) {
+                return 110;
+            }
+            if (string.Equals(kind, "tag", StringComparison.OrdinalIgnoreCase)) {
+                return 88;
+            }
+            return 94;
+        }
+
+        private static int ApplyBroadcasterMinHeight(string id, int forcedHeight)
+        {
+            const int broadcasterMinHeight = 108;
+            if (!string.IsNullOrEmpty(id)
+                && id.IndexOf("_broadcaster_", StringComparison.OrdinalIgnoreCase) >= 0
+                && forcedHeight < broadcasterMinHeight) {
+                return broadcasterMinHeight;
+            }
+
+            return forcedHeight;
+        }
+
+        private readonly struct MetadataImageResource
+        {
+            public string Id { get; }
+            public string Url { get; }
+            public bool Animated { get; }
+            public int ForcedHeight { get; }
+            public string Kind { get; }
+
+            public MetadataImageResource(string id, string url, bool animated, int forcedHeight, string kind)
+            {
+                Id = id;
+                Url = url;
+                Animated = animated;
+                ForcedHeight = forcedHeight;
+                Kind = kind;
+            }
+        }
     }
 }

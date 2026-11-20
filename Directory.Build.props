@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <!-- This file contains project properties used by the build. -->
 <Project>
 	<PropertyGroup>
@@ -7,6 +7,11 @@
 	</PropertyGroup>
 	<ItemGroup>
 		<OutputCopy Include="$(TargetPath)" OutputPath="Plugins\$(TargetName).dll" />
+		<OutputCopy Include="$(TargetDir)$(TargetName).pdb" OutputPath="Plugins\$(TargetName).pdb" />
 		<OutputCopy Include="FontAssets\sourcehansanscn-medium sdf.assets" OutputPath="UserData\FontAssets\Main\sourcehansanscn-medium sdf.assets" />
+		<!-- CatCore 运行时依赖（1.40.4 商店里没有对应版本，随插件一起安装） -->
+		<OutputCopy Include="Libs\CatCore\CatCore.dll" OutputPath="Libs\CatCore.dll" />
+		<OutputCopy Include="Libs\CatCore\CatCore.Svg.dll" OutputPath="Libs\CatCore.Svg.dll" />
+		<OutputCopy Include="Libs\CatCore\CatCore.manifest" OutputPath="Plugins\CatCore.manifest" />
 	</ItemGroup>
 </Project>
